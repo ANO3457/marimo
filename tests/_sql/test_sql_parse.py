@@ -207,14 +207,14 @@ class TestDuckDBInvalidQueries:
             ("SELECT * FROM table WHERE", ["syntax", "error"]),
             ("SELECT * FROM table ORDER", ["syntax", "error"]),
             ("INSERT INTO", ["syntax", "error"]),
-            ("UPDATE", ["syntax", "error"]),
-            ("DELETE", ["syntax", "error"]),
+            ("UPDATE users SET", ["syntax", "error"]),
+            ("DELETE FROM", ["syntax", "error"]),
             # Unclosed parentheses
             ("SELECT COUNT(*", ["syntax", "error"]),
             # Unclosed quotes
             # ("SELECT 'unclosed string", ["syntax", "error"]), # DuckDB does not raise errors for this case
             # # Invalid function call
-            ("SELECT COUNT(DISTINCT)", ["syntax", "error"]),
+            ("SELECT COUNT(DISTINCT FROM users)", ["syntax", "error"]),
             # # Malformed CASE statement
             ("SELECT CASE WHEN FROM table", ["syntax", "error"]),
             # # Incomplete JOIN
@@ -436,9 +436,6 @@ FRM users"""
         result, error = parse_sql(query_with_brackets, "duckdb")
         self.assert_line_column(result, error, expected_line, expected_column)
 
-    @pytest.mark.xfail(
-        reason="There is an incorrect calculation for column position"
-    )
     def test_brackets_on_error_line(self):
         # Brackets on error line
         query_error_line = """SELECT name,
@@ -453,6 +450,29 @@ id FRM users"""
         result, error = parse_sql(query_error_line_with_brackets, "duckdb")
         self.assert_line_column(
             result, error, expected_line, expected_column + 2
+        )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT {a}, {b}, {c}, {d}, {e};\nSELECT {value} FRM users",
+            "SELECT 'é😀', {a},\n{id} FRM users",
+            "SELECT {a}, {b}, {c}, {d}, {e} FRM users, {other}",
+            "SELECT {a\n} FRM users",
+            "SELECT {a\n+ b} FRM users",
+            "SELECT {a\n}, {b} FRM users",
+            "SELECT {a\n+ 😀} FRM users",
+        ],
+    )
+    def test_bracket_positions_after_replacements(self, query: str):
+        result, error = parse_sql(query, "duckdb")
+        prefix = query[: query.index("users")]
+        line_prefix = prefix.rsplit("\n", 1)[-1]
+        self.assert_line_column(
+            result,
+            error,
+            prefix.count("\n") + 1,
+            len(line_prefix.encode("utf-16-le")) // 2,
         )
 
     def test_multiline_brackets_after_error(self):

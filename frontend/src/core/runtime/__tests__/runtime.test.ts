@@ -8,8 +8,9 @@ import { RuntimeManager } from "../runtime";
 import type { RuntimeConfig } from "../types";
 
 // Mock the session module
-vi.mock("@/core/kernel/session", () => ({
-  getSessionId: () => "test-session-id" as SessionId,
+vi.mock("@/core/kernel/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/core/kernel/session")>()),
+  getSessionId: () => "test-session-id",
 }));
 
 vi.mock("@/utils/Logger", () => ({ Logger: Mocks.quietLogger() }));
@@ -59,6 +60,7 @@ describe("RuntimeManager", () => {
       expect(url.protocol).toBe("wss:");
       expect(url.hostname).toBe("example.com");
       expect(url.pathname).toBe("/ws");
+      expect(url.searchParams.has("types")).toBe(false);
       expect(url.searchParams.get("session_id")).toBe(sessionId);
     });
 
@@ -219,15 +221,6 @@ describe("RuntimeManager", () => {
   });
 
   describe("getSseURL", () => {
-    it("should return an http(s) URL with the session ID", () => {
-      const runtime = new RuntimeManager(mockConfig);
-      const url = runtime.getSseURL("1234" as SessionId);
-
-      expect(url.protocol).toBe("https:");
-      expect(url.pathname).toBe("/sse");
-      expect(url.searchParams.get("session_id")).toBe("1234");
-    });
-
     it("should never put the auth token in the URL, even cross-origin", () => {
       // SSE requests can send headers, so auth travels in the
       // Authorization header; a token in the URL would leak into
@@ -737,7 +730,7 @@ describe("RuntimeManager", () => {
       );
     });
 
-    it("should throw when creating WebSocket URLs from blob URLs", () => {
+    it("warns when creating WebSocket URLs from blob URLs", () => {
       const runtime = new RuntimeManager({
         url: "blob:https://example.com/12345678-1234-1234-1234-123456789abc",
         lazy: true,

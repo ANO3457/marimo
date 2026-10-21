@@ -1,0 +1,704 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+// @vitest-environment jsdom
+
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+} from "@testing-library/react";
+import { createStore, Provider as JotaiProvider } from "jotai";
+import type React from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type Mock,
+  vi,
+} from "vitest";
+
+vi.mock("../transports/create", () => ({
+  createConnectionTransport: vi.fn(),
+}));
+
+vi.mock("@/core/runtime/config", async () => {
+  const actual = await vi.importActual<typeof import("@/core/runtime/config")>(
+    "@/core/runtime/config",
+  );
+  return {
+    ...actual,
+    useRuntimeManager: vi.fn(),
+  };
+});
+
+import { MockNotebook } from "@/__mocks__/notebook";
+import { Logger } from "@/utils/Logger";
+import { Deferred } from "@/utils/Deferred";
+import { cellId } from "@/__tests__/branded";
+import { alertAtom, getPackageAlert } from "@/core/alerts/state";
+import { notebookAtom } from "@/core/cells/cells";
+import { AppConfigSchema } from "@/core/config/config-schema";
+import { ConnectionNotice } from "@/components/editor/alerts/connection-notice";
+import { kernelStartupErrorAtom } from "@/core/errors/state";
+import type { RunEvent } from "@marimo-team/client/protocol";
+import type { NotificationPayload } from "@/core/kernel/messages";
+import { useRuntimeManager } from "@/core/runtime/config";
+import { initialRunCompletedAtom } from "../../kernel/state";
+import { connectionAtom, startupProgressAtom } from "../../network/connection";
+import { generateSessionId } from "../../kernel/session";
+import { RuntimeManager } from "../../runtime/runtime";
+import { WebSocketClosedReason, ConnectionState } from "../types";
+import type { IConnectionTransport } from "../transports/transport";
+import { useNotebookSession } from "../useNotebookSession";
+import { createConnectionTransport } from "../transports/create";
+
+const SESSION_ID = generateSessionId();
+
+interface MockTransport {
+  readyState: 0 | 1 | 2 | 3;
+  reconnect: Mock<IConnectionTransport["reconnect"]>;
+  close: Mock<IConnectionTransport["close"]>;
+  send: Mock<IConnectionTransport["send"]>;
+  addEventListener: Mock<IConnectionTransport["addEventListener"]>;
+  removeEventListener: Mock<IConnectionTransport["removeEventListener"]>;
+}
+
+function makeTransport(
+  readyState: 0 | 1 | 2 | 3 = WebSocket.CLOSED,
+): MockTransport {
+  return {
+    readyState,
+    reconnect: vi.fn(),
+    close: vi.fn(),
+    send: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  };
+}
+
+function getTransportHandlers() {
+  const result = vi.mocked(createConnectionTransport).mock.results.at(-1);
+  if (!result || result.type !== "return") {
+    throw new Error("No connection transport was created");
+  }
+  const transport = result.value;
+  function emit(
+    event: "open" | "close" | "error" | "message",
+    message: Event | CloseEvent | MessageEvent,
+  ) {
+    const callback = vi
+      .mocked(transport.addEventListener)
+      .mock.calls.find(([name]) => name === event)?.[1];
+    callback?.(message);
+  }
+  return {
+    onError: (event: Event) => emit("error", event),
+    onOpen: (event: Event) => emit("open", event),
+    onClose: (event: CloseEvent) => emit("close", event),
+    onMessage: (event: MessageEvent) => emit("message", event),
+  };
+}
+
+function makeRuntimeManager(
+  reconcileFromHealth = vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+) {
+  const runtime = new RuntimeManager(
+    { url: "http://localhost", lazy: true },
+    true,
+  );
+  vi.spyOn(runtime, "reconcileFromHealth").mockImplementation(
+    reconcileFromHealth,
+  );
+  vi.spyOn(runtime, "probeHealth").mockResolvedValue(true);
+  vi.spyOn(runtime, "getWsURL").mockReturnValue(new URL("ws://localhost/ws"));
+  // Keep the initial connection pending; these tests exercise session retries.
+  vi.spyOn(runtime, "waitForHealthy").mockReturnValue(
+    new Deferred<void>().promise,
+  );
+  vi.spyOn(runtime, "isSameOrigin", "get").mockReturnValue(false);
+  return runtime;
+}
+
+function renderConnectionHook(store: ReturnType<typeof createStore>) {
+  const wrapper: React.FC<React.PropsWithChildren> = ({ children }) => (
+    <JotaiProvider store={store}>
+      <ErrorBoundary fallback={null}>{children}</ErrorBoundary>
+    </JotaiProvider>
+  );
+  return renderHook(
+    () =>
+      useNotebookSession({
+        sessionId: SESSION_ID,
+        autoInstantiate: false,
+        setCells: vi.fn(),
+      }),
+    { wrapper },
+  );
+}
+
+describe("useNotebookSession.reconnect()", () => {
+  let transport: MockTransport;
+  let isHealthy: Mock<() => Promise<boolean>>;
+  let store: ReturnType<typeof createStore>;
+
+  beforeEach(() => {
+    transport = makeTransport(WebSocket.CLOSED);
+    isHealthy = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
+    store = createStore();
+    store.set(connectionAtom, {
+      state: ConnectionState.CLOSED,
+      code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+      reason: "kernel not found",
+    });
+    vi.mocked(createConnectionTransport).mockReturnValue(transport);
+    vi.mocked(useRuntimeManager).mockReturnValue(makeRuntimeManager(isHealthy));
+  });
+
+  function renderUseHook() {
+    return renderConnectionHook(store);
+  }
+
+  it("is a no-op when the transport is already OPEN", async () => {
+    transport.readyState = WebSocket.OPEN;
+    const { result } = renderUseHook();
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(isHealthy).not.toHaveBeenCalled();
+    expect(transport.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when the transport is already CONNECTING", async () => {
+    transport.readyState = WebSocket.CONNECTING;
+    const { result } = renderUseHook();
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(isHealthy).not.toHaveBeenCalled();
+    expect(transport.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("probes /health and reconnects when the runtime is healthy", async () => {
+    isHealthy.mockResolvedValue(true);
+    const { result } = renderUseHook();
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(isHealthy).toHaveBeenCalledOnce();
+    expect(transport.reconnect).toHaveBeenCalledOnce();
+    expect(store.get(connectionAtom)).toEqual({
+      state: ConnectionState.CONNECTING,
+    });
+  });
+
+  it("transitions to CLOSED and does not call ws.reconnect when the probe fails", async () => {
+    isHealthy.mockResolvedValue(false);
+    const { result } = renderUseHook();
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(isHealthy).toHaveBeenCalledOnce();
+    expect(transport.reconnect).not.toHaveBeenCalled();
+    expect(store.get(connectionAtom)).toEqual({
+      state: ConnectionState.CLOSED,
+      code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+      reason: "kernel not found",
+    });
+  });
+});
+
+describe("useNotebookSession messages", () => {
+  let store: ReturnType<typeof createStore>;
+
+  beforeEach(() => {
+    store = createStore();
+    vi.mocked(createConnectionTransport).mockClear();
+    vi.mocked(createConnectionTransport).mockReturnValue(
+      makeTransport(WebSocket.OPEN),
+    );
+    vi.mocked(useRuntimeManager).mockReturnValue(makeRuntimeManager());
+    renderConnectionHook(store);
+  });
+
+  function receive(payload: unknown) {
+    const options = getTransportHandlers();
+    act(() => {
+      options.onMessage(
+        new MessageEvent("message", { data: JSON.stringify(payload) }),
+      );
+    });
+  }
+
+  it.each(["{broken", "null"])(
+    "closes a malformed stream and ignores subsequent notifications: %s",
+    (data) => {
+      receive({ event: "marimo", data: { marimo: { op: "reconnected" } } });
+      act(() =>
+        getTransportHandlers().onMessage(new MessageEvent("message", { data })),
+      );
+      expect(store.get(connectionAtom)).toEqual({
+        state: ConnectionState.CLOSED,
+        code: "KERNEL_DISCONNECTED",
+        reason: "Failed to decode notebook message",
+      });
+      receive({
+        event: "marimo",
+        data: {
+          marimo: {
+            op: "completed-run",
+            run_id: "r1",
+            outcome: "succeeded",
+            error: null,
+          },
+        },
+      });
+      expect(store.get(initialRunCompletedAtom)).toBe(false);
+    },
+  );
+
+  it.each(["session", "host"])(
+    "records completion of the initial run from the %s stream",
+    (stream) => {
+      const notification = {
+        op: "completed-run",
+        run_id: null,
+        outcome: "succeeded",
+        error: null,
+      } satisfies NotificationPayload["data"];
+      expect(store.get(initialRunCompletedAtom)).toBe(false);
+      receive(
+        stream === "host"
+          ? { id: "42", event: "marimo", data: { marimo: notification } }
+          : { op: notification.op, data: notification },
+      );
+      expect(store.get(initialRunCompletedAtom)).toBe(true);
+    },
+  );
+
+  it("ignores other host events before handling the next notification", () => {
+    const errors = vi.spyOn(Logger, "error").mockImplementation(vi.fn());
+    try {
+      receive({ id: "1", event: "ready", data: {} });
+      receive({
+        id: "2",
+        event: "run",
+        data: {
+          run: {
+            id: "r1",
+            notebook_id: "n1",
+            caused_by: null,
+            status: "completed",
+            outcome: "succeeded",
+            started_at: "2026-10-19T12:00:00Z",
+            completed_at: "2026-10-19T12:00:01Z",
+          },
+        },
+      } satisfies RunEvent);
+      receive({
+        id: "3",
+        event: "future-event",
+        data: { marimo: { op: "completed-run", run_id: "r1" } },
+      });
+      receive({ id: "4", event: "another-event", data: null });
+      expect(store.get(initialRunCompletedAtom)).toBe(false);
+      receive({
+        id: "5",
+        event: "marimo",
+        data: {
+          marimo: {
+            op: "completed-run",
+            run_id: "r1",
+            outcome: "succeeded",
+            error: null,
+          },
+        },
+      });
+      expect(store.get(initialRunCompletedAtom)).toBe(true);
+      expect(errors).not.toHaveBeenCalled();
+    } finally {
+      errors.mockRestore();
+    }
+  });
+});
+
+it.each(["kernel-ready", "reconnected"])(
+  "waits for %s before marking the session connected",
+  async (op) => {
+    const store = createStore();
+    store.set(connectionAtom, { state: ConnectionState.CONNECTING });
+    vi.mocked(createConnectionTransport).mockClear();
+    vi.mocked(createConnectionTransport).mockReturnValue(
+      makeTransport(WebSocket.OPEN),
+    );
+    vi.mocked(useRuntimeManager).mockReturnValue(makeRuntimeManager());
+    renderConnectionHook(store);
+    const options = getTransportHandlers();
+
+    await act(async () => {
+      await options.onOpen(new Event("open"));
+    });
+    expect(store.get(connectionAtom).state).toBe(ConnectionState.CONNECTING);
+
+    act(() => {
+      options.onMessage(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            op,
+            data: {
+              op,
+              cell_ids: [],
+              codes: [],
+              names: [],
+              configs: [],
+              layout: null,
+              resumed: true,
+              ui_values: {},
+              last_executed_code: {},
+              last_execution_time: {},
+              app_config: { width: "normal" },
+              kiosk: false,
+              capabilities: { terminal: false },
+              auto_instantiated: false,
+              consumer_capabilities: { edit: true, interact: true },
+            },
+          }),
+        }),
+      );
+    });
+    expect(store.get(connectionAtom).state).toBe(ConnectionState.OPEN);
+  },
+);
+
+describe("connection notice", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  function renderNotice() {
+    const store = createStore();
+    store.set(connectionAtom, { state: ConnectionState.CONNECTING });
+    const transport = makeTransport(WebSocket.OPEN);
+    vi.mocked(createConnectionTransport).mockReturnValue(transport);
+    vi.mocked(useRuntimeManager).mockReturnValue(makeRuntimeManager());
+    const Connection = () => {
+      const { reconnect } = useNotebookSession({
+        sessionId: SESSION_ID,
+        autoInstantiate: false,
+        setCells: vi.fn(),
+      });
+      return (
+        <ConnectionNotice
+          appConfig={AppConfigSchema.parse({})}
+          onRetry={reconnect}
+        />
+      );
+    };
+    render(
+      <JotaiProvider store={store}>
+        <ErrorBoundary fallback={null}>
+          <Connection />
+        </ErrorBoundary>
+      </JotaiProvider>,
+    );
+    const options = getTransportHandlers();
+    const send = (data: NotificationPayload["data"]) =>
+      act(() => {
+        options.onMessage(
+          new MessageEvent("message", {
+            data: JSON.stringify({ op: data.op, data }),
+          }),
+        );
+      });
+    return { store, transport, options, send };
+  }
+
+  it("keeps elapsed time across startup phases and leaves reconnection to the footer once cells are available", () => {
+    const { store, options, send } = renderNotice();
+    send({
+      op: "startup-progress",
+      phase: "preparing-environment",
+      logs: "",
+      log_mode: "replace",
+    });
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(500));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Preparing environment",
+    );
+    act(() => vi.advanceTimersByTime(35_000));
+    expect(screen.getByText("Elapsed 35s")).toBeInTheDocument();
+    send({
+      op: "startup-progress",
+      phase: "starting-kernel",
+      logs: "",
+      log_mode: "replace",
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Starting kernel");
+    expect(screen.getByText("Elapsed 35s")).toBeInTheDocument();
+    act(() =>
+      store.set(
+        notebookAtom,
+        MockNotebook.notebookState({
+          cellData: { [cellId("test")]: { code: "answer = 42" } },
+        }),
+      ),
+    );
+    expect(
+      screen.getByRole("button", { name: "Starting kernel… Open Packages" }),
+    ).toBeVisible();
+    expect(screen.queryByText(/Elapsed/)).not.toBeInTheDocument();
+    send({ op: "reconnected" });
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+    act(() => options.onClose(new CloseEvent("close")));
+    act(() => vi.advanceTimersByTime(500));
+    expect(store.get(connectionAtom)).toEqual({
+      state: ConnectionState.CONNECTING,
+      phase: "reconnecting",
+    });
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("restores startup output before appending live chunks and resets it for a new attempt", () => {
+    const { store, send } = renderNotice();
+    const snapshot = {
+      op: "startup-progress",
+      phase: "starting-kernel",
+      logs: "Downloading runtime\n",
+      log_mode: "replace",
+    } as const;
+    send(snapshot);
+    send(snapshot);
+    const connection = store.get(connectionAtom);
+    send({ ...snapshot, logs: "Loading kernel\n", log_mode: "append" });
+    expect(store.get(startupProgressAtom)).toEqual({
+      phase: "starting-kernel",
+      logs: "Downloading runtime\nLoading kernel\n",
+    });
+    expect(store.get(connectionAtom)).toBe(connection);
+    expect(getPackageAlert(store.get(alertAtom))).toBeNull();
+
+    send({ ...snapshot, phase: "preparing-environment", logs: "" });
+    expect(store.get(startupProgressAtom)).toEqual({
+      phase: "preparing-environment",
+      logs: "",
+    });
+  });
+
+  it("restores completed startup output without putting a connected kernel back into startup", async () => {
+    const { store, options, send } = renderNotice();
+    send({ op: "reconnected" });
+    send({
+      op: "startup-progress",
+      phase: "starting-kernel",
+      logs: "Kernel startup output\n",
+      log_mode: "replace",
+    });
+    expect(store.get(connectionAtom)).toEqual({ state: ConnectionState.OPEN });
+    expect(store.get(startupProgressAtom)).toEqual({
+      phase: "starting-kernel",
+      logs: "Kernel startup output\n",
+    });
+    act(() => vi.advanceTimersByTime(500));
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+
+    // A new transport starts from the next session's authoritative snapshot.
+    await act(async () => options.onOpen(new Event("open")));
+    expect(store.get(startupProgressAtom)).toBeNull();
+  });
+
+  it("does not flash a notice when startup finishes within the delay", () => {
+    const { send } = renderNotice();
+    send({
+      op: "startup-progress",
+      phase: "preparing-environment",
+      logs: "",
+      log_mode: "replace",
+    });
+    act(() => vi.advanceTimersByTime(200));
+    send({
+      op: "startup-progress",
+      phase: "starting-kernel",
+      logs: "",
+      log_mode: "replace",
+    });
+    act(() => vi.advanceTimersByTime(200));
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+    send({ op: "reconnected" });
+    act(() => vi.advanceTimersByTime(500));
+    expect(
+      screen.queryByRole("region", { name: "Notebook startup" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["preparing-environment", "starting-kernel"] as const)(
+    "keeps a %s failure available until the user retries",
+    async (phase) => {
+      const { store, transport, options, send } = renderNotice();
+      send({ op: "startup-progress", phase, logs: "", log_mode: "replace" });
+      const error = "A full diagnostic\nwith <stderr> details";
+      send({ op: "kernel-startup-error", error });
+      transport.readyState = WebSocket.CLOSED;
+      act(() =>
+        options.onClose(
+          new CloseEvent("close", { reason: "MARIMO_KERNEL_STARTUP_ERROR" }),
+        ),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Kernel failed to start",
+      );
+      act(() => vi.advanceTimersByTime(30_000));
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Kernel failed to start",
+      );
+      expect(screen.getByLabelText("Error details")).toHaveTextContent(error, {
+        normalizeWhitespace: false,
+      });
+      expect(transport.reconnect).not.toHaveBeenCalled();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Try again" })),
+      );
+      expect(transport.reconnect).toHaveBeenCalledOnce();
+      expect(store.get(kernelStartupErrorAtom)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Try again" }),
+      ).not.toBeInTheDocument();
+      send({
+        op: "startup-progress",
+        phase: "preparing-environment",
+        logs: "",
+        log_mode: "replace",
+      });
+      act(() => vi.advanceTimersByTime(500));
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Preparing environment",
+      );
+      expect(screen.getByText("Elapsed 0s")).toBeInTheDocument();
+    },
+  );
+});
+
+it("replaces environment state from snapshots, then continues live progress", () => {
+  const store = createStore();
+  vi.mocked(createConnectionTransport).mockClear();
+  vi.mocked(createConnectionTransport).mockReturnValue(
+    makeTransport(WebSocket.OPEN),
+  );
+  vi.mocked(useRuntimeManager).mockReturnValue(makeRuntimeManager());
+  renderConnectionHook(store);
+  const options = getTransportHandlers();
+  function receive(data: NotificationPayload["data"]) {
+    act(() =>
+      options?.onMessage(
+        new MessageEvent("message", {
+          data: JSON.stringify({ op: data.op, data }),
+        }),
+      ),
+    );
+  }
+  receive({
+    op: "environment-operation",
+    source: "kernel",
+    operation_id: "old",
+    action: "install",
+    status: { kind: "running" },
+    packages: { pandas: "running" },
+    logs: { pandas: "stale" },
+    log_mode: "append",
+  });
+  const operation = {
+    operation_id: "new",
+    action: "install",
+    source: "kernel",
+    status: { kind: "running" },
+    packages: { numpy: "running" },
+    logs: { numpy: "Downloading\n" },
+  } as const;
+  const serverOperation = {
+    ...operation,
+    operation_id: "server",
+    action: "install",
+    source: "server",
+    status: { kind: "succeeded" },
+    packages: { numpy: "succeeded" },
+    logs: { numpy: "Server logs\n" },
+  } as const;
+  receive({
+    op: "environment-state",
+    source: "server",
+    state: {
+      restart_required: false,
+      operations: [serverOperation],
+    },
+  });
+  const snapshot = {
+    op: "environment-state",
+    source: "kernel",
+    state: { restart_required: false, operations: [operation] },
+  } as const;
+  // Receiving a snapshot twice must not duplicate logs.
+  receive({
+    ...snapshot,
+    state: { ...snapshot.state, operations: [operation] },
+  });
+  receive({
+    ...snapshot,
+    state: { ...snapshot.state, operations: [operation] },
+  });
+  receive({
+    op: "environment-operation",
+    operation_id: "new",
+    action: "install",
+    source: "kernel",
+    status: { kind: "failed", error: "Network unavailable" },
+    packages: { numpy: "running" },
+    logs: { numpy: "Failed\n" },
+    log_mode: "append",
+  });
+  expect(getPackageAlert(store.get(alertAtom))).toEqual({
+    ...operation,
+    id: "new",
+    kind: "environment",
+    restartRequired: false,
+    status: { kind: "failed", error: "Network unavailable" },
+    logs: { numpy: "Downloading\nFailed\n" },
+  });
+  receive({
+    op: "environment-state",
+    source: "kernel",
+    state: {
+      restart_required: false,
+      operations: [],
+    },
+  });
+  // Clearing the active environment must not promote an old server success.
+  expect(getPackageAlert(store.get(alertAtom))).toBeNull();
+  expect(store.get(alertAtom).environments.server.operations).toEqual([
+    serverOperation,
+  ]);
+  receive({
+    op: "environment-state",
+    source: "server",
+    state: {
+      restart_required: false,
+      operations: [],
+    },
+  });
+  expect(getPackageAlert(store.get(alertAtom))).toBeNull();
+  expect(store.get(alertAtom).environments).toEqual({
+    kernel: { restart_required: false, operations: [] },
+    server: { restart_required: false, operations: [] },
+  });
+});

@@ -150,12 +150,16 @@ interface ChatHeaderProps {
   onNewChat: () => void;
   activeChatId: ChatId | undefined;
   setActiveChat: (id: ChatId | null) => void;
+  onDeleteChats: (id: ChatId | null) => void;
+  isLoading: boolean;
 }
 
 const ChatHeader: React.FC<ChatHeaderProps> = ({
   onNewChat,
   activeChatId,
   setActiveChat,
+  onDeleteChats,
+  isLoading,
 }) => {
   const { handleClick } = useOpenSettingsToTab();
 
@@ -184,6 +188,8 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
         <ChatHistoryPopover
           activeChatId={activeChatId}
           setActiveChat={setActiveChat}
+          onDeleteChats={onDeleteChats}
+          isLoading={isLoading}
         />
       </div>
     </div>
@@ -710,14 +716,10 @@ const ChatPanelBody = () => {
   );
 
   const isLoading = status === "submitted" || status === "streaming";
-  // Read via a ref so the queue-vs-send decision stays correct even when it is
-  // made after an `await` (e.g. resolving @-context), by which point the render
-  // closure's `isLoading` may be stale.
-  const isLoadingRef = useRef(isLoading);
-  isLoadingRef.current = isLoading;
-
+  // useEvent reads the latest loading state, even when called after an await
+  // (e.g. resolving @-context) that outlives the original render's closure.
   const submitOrQueue = useEvent((parts: ChatMessagePart[]) => {
-    if (isLoadingRef.current || hasQueuedRef.current) {
+    if (isLoading || hasQueuedRef.current) {
       enqueueUserMessage(parts);
     } else {
       sendUserMessage(parts);
@@ -836,6 +838,27 @@ const ChatPanelBody = () => {
     setNewThreadInput("");
     clearQueuedMessages();
     clearFiles();
+  });
+
+  const handleDeleteChats = useEvent((id: ChatId | null) => {
+    if (id === null || id === activeChatId) {
+      handleNewChat();
+    }
+    setChatState((prev) => {
+      const chats = new Map(prev.chats);
+      if (id === null) {
+        chats.clear();
+      } else {
+        chats.delete(id);
+      }
+      return {
+        chats,
+        activeChatId:
+          prev.activeChatId && chats.has(prev.activeChatId)
+            ? prev.activeChatId
+            : null,
+      };
+    });
   });
 
   const handlePairWithAgent = useEvent(() => {
@@ -997,6 +1020,8 @@ const ChatPanelBody = () => {
           onNewChat={handleNewChat}
           activeChatId={activeChat?.id}
           setActiveChat={setActiveChat}
+          onDeleteChats={handleDeleteChats}
+          isLoading={isLoading}
         />
       </TooltipProvider>
 

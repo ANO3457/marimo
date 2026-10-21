@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from marimo import _loggers
 from marimo._core import backend as be, protocol
 from marimo._messaging.notification import (
@@ -15,25 +17,30 @@ from marimo._messaging.notification import (
     CompletedRunNotification,
     ExecutionNotification,
     InterruptedNotification,
+    NotebookDocumentTransactionNotification,
     StartupProgressNotification,
 )
 from marimo._messaging.serde import deserialize_kernel_message
-from marimo._runtime.commands import ExecuteScratchpadCommand
+from marimo._runtime.commands import ExecuteScratchpadCommand, HTTPRequest
 from marimo._runtime.scratch import SCRATCH_CELL_ID
+from marimo._server.host.events import notification_event
 from marimo._server.host.translate import RunTranslator
 from marimo._server.scratchpad import snapshot_for_scratchpad
 from marimo._session.consumer import SessionConsumer
-from marimo._session.model import ConnectionState
+from marimo._session.model import ConnectionState, SessionMode
 from marimo._session.requests import InstantiateNotebookRequest
 from marimo._session.types import KernelState
 from marimo._types.ids import ConsumerId, SessionId
 from marimo._version import __version__
 
 if TYPE_CHECKING:
+    from marimo._core.stream import Sink
+    from marimo._messaging.notification import NotificationMessage
     from marimo._messaging.types import KernelMessage
     from marimo._server.session_manager import SessionManager
     from marimo._session.events import SessionEventBus
     from marimo._session.session import Session
+    from marimo._types.encodable import Encodable
 
 LOGGER = _loggers.marimo_logger()
 
@@ -43,6 +50,16 @@ _PHASES = {
 }
 
 Observe = Callable[[be.Message], None]
+RequestMetadata = Callable[["Session"], dict[str, "Encodable"]]
+
+
+@dataclass
+class _Kernel:
+    """The session backing one runtime, once it exists."""
+
+    runtime_id: protocol.RuntimeId
+    session: Session | None = None
+    stop_requested: bool = False
 
 
 @dataclass
@@ -67,30 +84,48 @@ class SessionBackend(SessionConsumer):
         file: Callable[[], str | None],
         manager: SessionManager,
         observe: Observe,
+        sink: Sink,
+        document_changed: Callable[[], None] | None = None,
+        session_attached: Callable[[], None] | None = None,
+        session_detached: Callable[[Session], None] | None = None,
+        *,
+        request_metadata: RequestMetadata | None = None,
     ) -> None:
         self._notebook_id = notebook_id
         self._file = file
         """Resolve the notebook's current path after file moves."""
         self._manager = manager
         self._observe = observe
-        self.session: Session | None = None
-        self._stop_requested = False
+        self._sink = sink
+        self._document_changed = document_changed
+        """Called after the session's document changes, from any writer."""
+        self._session_attached = session_attached
+        """Called with the session attached, before the runtime is reported."""
+        self._session_detached = session_detached
+        """Called with the session that detached, before its exit is reported."""
+        self._request_metadata = request_metadata
+        self._kernel: _Kernel | None = None
         self._run: _Run | None = None
         self._translators: dict[str, RunTranslator] = {}
+
+    @property
+    def session(self) -> Session | None:
+        """The session backing the current runtime, once attached."""
+        return None if self._kernel is None else self._kernel.session
 
     # Backend commands
 
     def start(self, runtime_id: protocol.RuntimeId) -> None:
-        self._stop_requested = False
+        kernel = self._kernel = _Kernel(runtime_id)
         asyncio.get_running_loop().create_task(
-            self._start(SessionId(f"host-{runtime_id}")),
+            self._start(kernel, SessionId(f"host-{runtime_id}")),
             name=f"host.start.{runtime_id}",
         )
 
-    async def _start(self, session_id: SessionId) -> None:
+    async def _start(self, kernel: _Kernel, session_id: SessionId) -> None:
         file = self._file()
         if file is None:
-            self._observe(be.Exited("The notebook has no file to run"))
+            self._fail(kernel, "The notebook has no file to run")
             return
         try:
             await self._manager.create_session(
@@ -105,16 +140,24 @@ class SessionBackend(SessionConsumer):
             LOGGER.warning(
                 "Kernel for %s failed to start", file, exc_info=True
             )
-            self._observe(be.Exited(str(e) or type(e).__name__))
+            self._fail(kernel, str(e) or type(e).__name__)
             return
         # Apply a stop requested during startup.
-        if self._stop_requested:
-            self.stop()
+        if kernel.stop_requested:
+            self.stop(kernel.runtime_id)
 
-    def stop(self) -> None:
-        session = self.session
+    def _fail(self, kernel: _Kernel, reason: str) -> None:
+        if self._kernel is kernel:
+            self._kernel = None
+        self._observe(be.Exited(kernel.runtime_id, reason))
+
+    def stop(self, runtime_id: protocol.RuntimeId) -> None:
+        kernel = self._kernel
+        if kernel is None or kernel.runtime_id != runtime_id:
+            return
+        session = kernel.session
         if session is None:
-            self._stop_requested = True
+            kernel.stop_requested = True
             return
         for session_id, candidate in self._manager.sessions.items():
             if candidate is session:
@@ -146,12 +189,34 @@ class SessionBackend(SessionConsumer):
                 http_request=None,
             )
             cells, outputs = snapshot_for_scratchpad(session)
+            request = None
+            if self._request_metadata is not None:
+                # Host runs have no HTTP origin. Give the URL fields the same
+                # keys a real request has so notebook code can read them.
+                empty_url: dict[str, Encodable] = {
+                    "path": "",
+                    "port": None,
+                    "scheme": "",
+                    "netloc": "",
+                    "query": "",
+                    "hostname": None,
+                }
+                request = HTTPRequest(
+                    url=dict(empty_url),
+                    base_url=dict(empty_url),
+                    headers={},
+                    query_params={},
+                    path_params={},
+                    cookies={},
+                    user={},
+                    meta=self._request_metadata(session),
+                )
             run.submitted = True
             self._translators[run.translator.run_id] = run.translator
             session.put_control_request(
                 ExecuteScratchpadCommand(
                     code=code,
-                    request=None,
+                    request=request,
                     notebook_cells=cells,
                     cell_outputs=outputs,
                     run_id=run.translator.run_id,
@@ -207,11 +272,20 @@ class SessionBackend(SessionConsumer):
 
     # Existing sessions
 
-    def adopt(self, session: Session) -> None:
-        """Observe an existing session."""
+    def adopt(self, runtime_id: protocol.RuntimeId, session: Session) -> None:
+        """Observe an existing session as the given runtime."""
         if self.session is not None:
             return
-        session.connect_consumer(self, main=False)
+        kernel = self._kernel = _Kernel(runtime_id)
+        try:
+            session.connect_consumer(self, main=False)
+        except Exception as e:
+            LOGGER.warning("Failed to adopt session", exc_info=True)
+            # Detachment must not report a second exit or close the session
+            # that another client owns.
+            self._kernel = None
+            session.disconnect_consumer(self)
+            self._fail(kernel, str(e) or type(e).__name__)
 
     # Session consumer
 
@@ -224,14 +298,22 @@ class SessionBackend(SessionConsumer):
 
     def on_attach(self, session: Session, event_bus: SessionEventBus) -> None:
         del event_bus
-        self.session = session
-        self._observe(be.Running(__version__))
+        kernel = self._kernel
+        if kernel is None:
+            return
+        kernel.session = session
+        if self._session_attached is not None:
+            self._session_attached()
+        self._observe(be.Running(kernel.runtime_id, __version__))
 
     def on_detach(self) -> None:
         """Report session closure and release any waiting run."""
-        session, self.session = self.session, None
-        if session is None:
+        kernel, self._kernel = self._kernel, None
+        if kernel is None or kernel.session is None:
             return
+        session = kernel.session
+        if self._session_detached is not None:
+            self._session_detached(session)
         reason = None
         if session.kernel_state() is KernelState.STOPPED:
             info = session.kernel_exit_info()
@@ -240,14 +322,23 @@ class SessionBackend(SessionConsumer):
         if run is not None and run.task is not None:
             run.task.cancel()
         self._translators.clear()
-        self._observe(be.Exited(reason))
+        self._observe(be.Exited(kernel.runtime_id, reason))
 
     def notify(self, notification: KernelMessage) -> None:
         message = deserialize_kernel_message(notification)
+        with self._sink.deferred():
+            self._sink.append(notification_event(self._notebook_id, message))
+            self._handle_notification(message)
+
+    def _handle_notification(self, message: NotificationMessage) -> None:
+        if isinstance(message, NotebookDocumentTransactionNotification):
+            if self._document_changed is not None and self.session is not None:
+                self._document_changed()
+            return
         if isinstance(message, StartupProgressNotification):
-            self._observe(
-                be.Starting(_PHASES.get(message.phase, message.phase))
-            )
+            if (kernel := self._kernel) is not None:
+                phase = _PHASES.get(message.phase, message.phase)
+                self._observe(be.Starting(kernel.runtime_id, phase))
             return
         if not isinstance(
             message,
@@ -277,6 +368,19 @@ class SessionBackend(SessionConsumer):
             )
             self._translators[run_id] = translator
             self._observe(be.Scheduled(translator.run_id))
+        # Run kernels omit source from native notifications. App documents are
+        # immutable, so recover the submitted source for host revision hashes.
+        # Keep the native message private and unchanged in the shared log.
+        if (
+            isinstance(message, ExecutionNotification)
+            and message.phase == "planned"
+            and message.code is None
+            and self._manager.mode is SessionMode.RUN
+            and self.session is not None
+        ):
+            cell = self.session.document.get(message.cell_id)
+            if cell is not None:
+                message = msgspec.structs.replace(message, code=cell.code)
         for out in translator.feed(message):
             self._observe(out)
         if translator.completed:

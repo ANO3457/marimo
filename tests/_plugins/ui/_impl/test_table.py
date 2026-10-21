@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from asyncio import CancelledError
 from datetime import date, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,7 @@ from marimo._plugins.ui._impl.table import (
     ColumnSummariesArgs,
     DownloadAsArgs,
     DownloadAsOptions,
+    DownloadAsResponse,
     SearchTableArgs,
     SortArgs,
     TableSearchError,
@@ -600,6 +602,42 @@ def test_value_with_cell_selection_then_sorting_dict_of_lists() -> None:
         TableCell(row="2", column="company", value="Company E"),
     ]
     assert type(table.value) is list
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_search_sort_mismatched_columns_with_pagination(
+    descending: bool,
+) -> None:
+    data = {"a": [2], "b": [10, 20]}
+    table = ui.table(data)
+    expected = [{"a": 2, "b": 10}, {"a": None, "b": 20}]
+    if descending:
+        expected.reverse()
+
+    for page_number, row in enumerate(expected):
+        response = table._search(
+            SearchTableArgs(
+                sort=[SortArgs(by="b", descending=descending)],
+                page_size=1,
+                page_number=page_number,
+            )
+        )
+        assert response.total_rows == 2
+        assert json.loads(response.data) == [row]
+        assert table._convert_value([str(page_number)]) == {
+            column: [value] for column, value in row.items()
+        }
+
+    assert data == {"a": [2], "b": [10, 20]}
+
+
+def test_select_rows_mismatched_columns() -> None:
+    data = {"a": [2], "b": [10, 20]}
+    table = ui.table(data, selection="multi")
+
+    assert table._convert_value(["0", "1"]) == {"a": [2, None], "b": [10, 20]}
+    assert table._convert_value(["1"]) == {"a": [None], "b": [20]}
+    assert data == {"a": [2], "b": [10, 20]}
 
 
 def test_search_sort_nonexistent_columns() -> None:
@@ -1795,6 +1833,74 @@ def test_download_arrow_wkb_as_complete_wkt(format_type: str) -> None:
     assert source.schema.field("geometry").metadata == metadata
 
 
+@pytest.mark.requires("pyarrow", "shapely")
+@pytest.mark.parametrize("format_type", TEXT_DOWNLOAD_FORMATS)
+@pytest.mark.parametrize("encoding", ["wkb", "wkt"])
+def test_download_registered_arrow_geometry_as_complete_text(
+    format_type: str, encoding: str
+) -> None:
+    import pyarrow as pa
+    from shapely import from_wkt
+
+    from tests._plugins.ui._impl.tables import geometry_fixtures as fixtures
+
+    long_geometry = from_wkt(LONG_GEOMETRY_WKT)
+    if encoding == "wkb":
+        storage_type = pa.binary()
+        values = [long_geometry.wkb, from_wkt(POINT_GEOMETRY_WKT).wkb, None]
+        expected_long = long_geometry.wkt
+    else:
+        storage_type = pa.string()
+        values = [LONG_GEOMETRY_WKT, POINT_GEOMETRY_WKT, None]
+        expected_long = LONG_GEOMETRY_WKT
+
+    with fixtures.registered_arrow_extension(
+        f"geoarrow.{encoding}", storage_type
+    ) as extension:
+        geometry = fixtures.registered_extension_column(
+            extension, [values[:2], values[2:]]
+        )
+        source = pa.table(
+            {"row_label": ["long", "point", "null"], "geometry": geometry}
+        )
+
+        rows = _download_text_rows(ui.table(source), format_type)
+
+        _assert_complete_geometry_rows(rows, format_type, expected_long)
+        assert source.schema.field("geometry").type == extension
+        assert source.column("geometry").num_chunks == 2
+        assert source.column("geometry").to_pylist() == values
+
+
+@pytest.mark.requires("pyarrow")
+def test_download_registered_arrow_wkb_without_shapely_as_hex() -> None:
+    import pyarrow as pa
+
+    from tests._plugins.ui._impl.tables import geometry_fixtures as fixtures
+
+    wkb = fixtures.WKB_POINT_1_2
+    with fixtures.registered_arrow_extension(
+        "geoarrow.wkb", pa.binary()
+    ) as extension:
+        source = pa.table(
+            {
+                "row_label": ["point", "null"],
+                "geometry": fixtures.registered_extension_column(
+                    extension, [[wkb, None]]
+                ),
+            }
+        )
+        with patch.object(
+            DependencyManager.shapely, "has", return_value=False
+        ):
+            rows = _download_text_rows(ui.table(source), "csv")
+
+    assert rows == [
+        {"row_label": "point", "geometry": wkb.hex()},
+        {"row_label": "null", "geometry": ""},
+    ]
+
+
 @pytest.mark.requires("duckdb", "pyarrow")
 @pytest.mark.parametrize("format_type", TEXT_DOWNLOAD_FORMATS)
 def test_download_duckdb_geometry_as_complete_text(
@@ -1861,7 +1967,7 @@ def test_geometry_text_download_preserves_row_selection() -> None:
 @pytest.mark.requires("pyarrow", "shapely")
 def test_invalid_wkb_does_not_publish_an_artifact() -> None:
     import pyarrow as pa
-    from shapely.errors import GEOSException
+    import shapely
 
     metadata = {b"ARROW:extension:name": b"geoarrow.wkb"}
     field = pa.field("geometry", pa.binary(), metadata=metadata)
@@ -1875,14 +1981,14 @@ def test_invalid_wkb_does_not_publish_an_artifact() -> None:
         schema=pa.schema([field]),
     )
 
-    with (
-        patch(
-            "marimo._plugins.ui._impl.utils.dataframe.mo_data.any_data"
-        ) as publish,
-        pytest.raises(GEOSException),
-    ):
-        ui.table(source)._download_as(DownloadAsArgs(format="json"))
+    with pytest.raises(shapely.errors.GEOSException) as expected:
+        shapely.from_wkb(b"invalid")
+    with patch(
+        "marimo._plugins.ui._impl.utils.dataframe.mo_data.any_data"
+    ) as publish:
+        response = ui.table(source)._download_as(DownloadAsArgs(format="json"))
 
+    assert response == DownloadAsResponse(error=str(expected.value))
     publish.assert_not_called()
 
 
@@ -3702,3 +3808,85 @@ def test_column_widths_unknown_column():
 def test_column_widths_non_positive():
     with pytest.raises(ValueError, match="positive integer"):
         ui.table({"a": [1, 2]}, column_widths={"a": 0})
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(), GeneratorExit(), CancelledError()],
+)
+def test_download_preserves_control_flow(error: BaseException) -> None:
+    table = ui.table({"a": [1]})
+    with patch(
+        "marimo._plugins.ui._impl.table.download_as", side_effect=error
+    ):
+        with pytest.raises(type(error)):
+            table._download_as(DownloadAsArgs(format="csv"))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(), GeneratorExit(), CancelledError()],
+)
+def test_chart_csv_preserves_control_flow(error: BaseException) -> None:
+    table = ui.table({"a": [1]})
+    manager = table._searched_manager
+    with (
+        patch.object(DependencyManager.pyarrow, "has", return_value=False),
+        patch.object(type(manager), "to_csv", side_effect=error),
+    ):
+        with pytest.raises(type(error)):
+            table._to_chart_data_url(manager)
+
+
+@pytest.mark.requires("polars")
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("container", ["map", "struct"])
+def test_binary_export_failure_is_contained(
+    lazy: bool, container: str
+) -> None:
+    import polars as pl
+
+    from marimo._plugins.ui._impl.tables.polars_table import (
+        PolarsTableManagerFactory,
+    )
+
+    map_dtype = getattr(pl, "Map", None)
+    if container == "map":
+        if map_dtype is None:
+            pytest.skip("Map dtype requires Polars 2")
+        values = [{1: b"abc"}, {}, None]
+        dtype = map_dtype(pl.Int64, pl.Binary)
+        expected_error = pl.exceptions.ComputeError
+        expected_json = [
+            {"value": {"1": "abc"}},
+            {"value": {}},
+            {"value": None},
+        ]
+    else:
+        values = [{"binary": b"abc"}, {"binary": None}, None]
+        dtype = pl.Struct({"binary": pl.Binary})
+        expected_error = pl.exceptions.PanicException
+        expected_json = [
+            {"value": {"binary": "abc"}},
+            {"value": {"binary": None}},
+            {"value": None},
+        ]
+    source = pl.DataFrame({"value": pl.Series(values, dtype=dtype)})
+    data = source.lazy() if lazy else source
+    manager = PolarsTableManagerFactory.create()(data)
+    with pytest.raises(expected_error) as original:
+        manager.to_csv_str()
+
+    table = ui.table(data)
+    with patch(
+        "marimo._plugins.ui._impl.utils.dataframe.mo_data.any_data"
+    ) as publish:
+        response = table._download_as(DownloadAsArgs(format="csv"))
+    assert response == DownloadAsResponse(error=str(original.value))
+    publish.assert_not_called()
+
+    with patch.object(DependencyManager.pyarrow, "has", return_value=False):
+        url, data_format = table._to_chart_data_url(manager)
+    assert data_format == "json"
+    assert json.loads(from_data_uri(url)[1]) == expected_json
+    assert manager.collect().equals(source)

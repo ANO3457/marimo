@@ -7,34 +7,59 @@ import asyncio
 import hashlib
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, TypeVar
 from urllib.parse import quote
 
 import msgspec
+from anyio import create_task_group
 from starlette.exceptions import HTTPException
 from starlette.responses import Response, StreamingResponse
-from starlette.routing import Route, Router
+from starlette.routing import Route, Router, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from marimo import _loggers
 from marimo._core import protocol
-from marimo._core.errors import Conflict, NoRuntime, NotFound
-from marimo._server.api.auth import TOKEN_QUERY_PARAM
-from marimo._server.api.deps import AppStateBase
+from marimo._core.errors import (
+    Conflict,
+    DecisionRequired,
+    EditConflict,
+    Invalid,
+    NoRuntime,
+    NotFound,
+)
+from marimo._server.api.auth import TOKEN_QUERY_PARAM, validate_auth
+from marimo._server.api.deps import AppState, AppStateBase
+from marimo._server.api.endpoints.ws.ws_connection_validator import (
+    ConnectionRejection,
+    parse_connection_params,
+)
+from marimo._server.api.endpoints.ws_endpoint import DOC_MANAGER
 from marimo._server.api.utils import format_url_host, open_url_in_browser
+from marimo._server.host import (
+    ATTACHMENT_IDENTITY,
+    ATTACHMENT_KIND,
+    ATTACHMENT_NAME,
+    HOST_API_PATH,
+    stream_options,
+)
 from marimo._server.host.context import CachedMutation
+from marimo._server.host.events import serialize_event, serialize_sse_event
+from marimo._server.host.session import SessionEventStream
 from marimo._server.sse import SSE_HEADERS
 from marimo._server.tokens import AuthToken
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
-    from starlette.requests import Request
-    from starlette.types import ASGIApp
+    from anyio import CancelScope
+    from starlette.requests import HTTPConnection, Request
 
     from marimo._core.notebook import Notebook
-    from marimo._core.stream import Event
+    from marimo._core.stream import RoutedEvent
+    from marimo._server.host.bridge import SessionBridge
     from marimo._server.host.context import HostContext
 
 LOGGER = _loggers.marimo_logger()
@@ -45,28 +70,67 @@ _Body = TypeVar("_Body", bound=msgspec.Struct)
 PROBLEM_TYPE_PREFIX = "tag:marimo.io,2026:host/"
 """Prefix for host protocol problem types."""
 
+
+_ATTACHMENT_HEADERS = {
+    "identity": ATTACHMENT_IDENTITY,
+    "kind": ATTACHMENT_KIND,
+    "name": ATTACHMENT_NAME,
+}
+"""Attachment fields and the request headers that supply them."""
+
 PING = b": ping\n\n"
 PING_SECONDS = 15.0
+
 
 _TITLES = {
     "invalid-request": "Invalid request",
     "unauthorized": "Unauthorized",
     "forbidden": "Forbidden",
     "not-found": "Not found",
+    "method-not-allowed": "Method not allowed",
     "conflict": "Conflict",
     "no-runtime": "No runtime",
+    "decision-required": "Decision required",
     "unsupported-operation": "Unsupported operation",
     "internal": "Internal error",
 }
 
 
-def problem(status: int, kind: str, detail: str | None = None) -> Response:
-    """Return a protocol error as an HTTP problem response."""
+_HTTP_KINDS = {
+    400: "invalid-request",
+    404: "not-found",
+    405: "method-not-allowed",
+    409: "conflict",
+}
+
+
+def problem(
+    status: int,
+    kind: str | None = None,
+    detail: str | None = None,
+    *,
+    edit: protocol.EditConflict | None = None,
+    decisions: tuple[protocol.Decision, ...] | None = None,
+) -> Response:
+    """Return a protocol error as an HTTP problem response.
+
+    Without a kind, the status picks one. A status this protocol does
+    not name is a server bug, so it becomes a 500 rather than a problem
+    of an unknown kind. A conflict over an edit carries `edit`, and a
+    request that needs a choice first carries `decisions`.
+    """
+    kind = _HTTP_KINDS.get(status) if kind is None else kind
+
+    if kind is None:
+        LOGGER.error("The host API raised an unmapped status %s", status)
+        status, kind, detail = 500, "internal", "The host failed"
     body = protocol.Problem(
         type=PROBLEM_TYPE_PREFIX + kind,
         title=_TITLES[kind],
         status=status,
         detail=msgspec.UNSET if detail is None else detail,
+        edit=msgspec.UNSET if edit is None else edit,
+        decisions=msgspec.UNSET if decisions is None else decisions,
     )
     return Response(
         msgspec.json.encode(body),
@@ -75,48 +139,64 @@ def problem(status: int, kind: str, detail: str | None = None) -> Response:
     )
 
 
-def build_app() -> ASGIApp:
+def build_app() -> Router:
     """Build the host API router."""
+    routes = [
+        Route("/events", _events, methods=["GET"]),
+        Route("/notebooks", _create_notebook, methods=["POST"]),
+        Route("/notebooks/{id}", _update_notebook, methods=["PATCH"]),
+        Route("/notebooks/{id}", _delete_notebook, methods=["DELETE"]),
+        Route("/notebooks/{id}/events", _notebook_events, methods=["GET"]),
+        WebSocketRoute("/notebooks/{id}/events/ws", _notebook_events_ws),
+        Route("/notebooks/{id}/edits", _edit_notebook, methods=["POST"]),
+        Route("/notebooks/{id}/save", _save_notebook, methods=["POST"]),
+        Route("/notebooks/{id}/open", _open_notebook, methods=["POST"]),
+        Route("/notebooks/{id}/runtime", _start_runtime, methods=["PUT"]),
+        Route("/notebooks/{id}/runtime", _stop_runtime, methods=["DELETE"]),
+        Route(
+            "/notebooks/{id}/runtime/restart",
+            _restart_runtime,
+            methods=["POST"],
+        ),
+        Route("/notebooks/{id}/runtime/runs", _run, methods=["POST"]),
+        Route(
+            "/notebooks/{id}/runtime/runs/{run_id}",
+            _interrupt,
+            methods=["DELETE"],
+        ),
+    ]
+    for route in routes:
+        # Starlette implies HEAD for every GET route, but a HEAD here would
+        # open a real stream and attach a client nobody can see.
+        if isinstance(route, Route) and route.methods == {"GET", "HEAD"}:
+            route.methods = {"GET"}
     return Router(
-        routes=[
-            Route("/events", _events, methods=["GET"]),
-            Route("/notebooks", _create_notebook, methods=["POST"]),
-            Route("/notebooks/{id}", _update_notebook, methods=["PATCH"]),
-            Route("/notebooks/{id}", _delete_notebook, methods=["DELETE"]),
-            Route("/notebooks/{id}/events", _notebook_events, methods=["GET"]),
-            Route("/notebooks/{id}/open", _open_notebook, methods=["POST"]),
-            Route("/notebooks/{id}/runtime", _start_runtime, methods=["PUT"]),
-            Route(
-                "/notebooks/{id}/runtime", _stop_runtime, methods=["DELETE"]
-            ),
-            Route(
-                "/notebooks/{id}/runtime/restart",
-                _restart_runtime,
-                methods=["POST"],
-            ),
-            Route("/notebooks/{id}/runtime/runs", _run, methods=["POST"]),
-            Route(
-                "/notebooks/{id}/runtime/runs/{run_id}",
-                _interrupt,
-                methods=["DELETE"],
-            ),
-        ],
+        routes=routes,
         default=_not_found,
+        # Clients never follow redirects, so a trailing slash is a miss.
+        redirect_slashes=False,
     )
 
 
 async def _not_found(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+    if scope["type"] == "websocket":
+        await WebSocket(scope, receive, send).close(
+            code=1008, reason="No such route"
+        )
+        return
     await problem(404, "not-found", "No such route")(scope, receive, send)
 
 
-def _context(request: Request) -> HostContext:
+def _context(request: HTTPConnection) -> HostContext:
     context = getattr(request.app.state, "host_context", None)
     assert context is not None, "HostApiMiddleware admits requests only then"
     return context  # type: ignore[no-any-return]
 
 
-def _notebook(request: Request) -> Notebook:
-    return _context(request).bridge.host.notebook(request.path_params["id"])
+async def _notebook(request: HTTPConnection) -> Notebook:
+    return await _context(request).bridge.host.notebook(
+        request.path_params["id"]
+    )
 
 
 def _record(request: Request) -> protocol.Notebook:
@@ -147,8 +227,13 @@ def _mutation(operation: str) -> Callable[[_Endpoint], _Endpoint]:
                     400, "invalid-request", "Idempotency-Key is required"
                 )
             digest = hashlib.sha256(await request.body()).hexdigest()
-            fingerprint = f"{request.method} {request.url.path} {digest}"
-            remembered = context.replies.get(key)
+            # A precondition is part of the request, so a retry that
+            # names another revision is another request.
+            if_match = request.headers.get("If-Match", "")
+            fingerprint = (
+                f"{request.method} {request.url.path} {digest} {if_match}"
+            )
+            remembered = context.remembered(key)
             if remembered is not None:
                 if remembered.fingerprint != fingerprint:
                     return problem(
@@ -165,24 +250,37 @@ def _mutation(operation: str) -> Callable[[_Endpoint], _Endpoint]:
             mutation = CachedMutation(fingerprint, task)
             context.replies[key] = mutation
             unsubscribe: Callable[[], None] | None = None
+            lifecycle_accepted: Callable[[Response], None] | None = None
             if operation == "runtime.run" and request.method == "POST":
-                # Retain the last run state even after a restart removes it
-                # from the notebook. Replaying the key must never execute again.
-                def updated(event: Event) -> None:
-                    if isinstance(event.data, protocol.RunMessage):
-                        run = event.data.run
-                        if run.id == key:
+                # The receipt outlives results without retaining their payloads.
+                def updated(event: RoutedEvent) -> None:
+                    if isinstance(event.event, protocol.RunEvent):
+                        run = event.event.data.run
+                        if event.event.data.request_id == key:
                             mutation.run = run
                             if (
                                 run.status == "completed"
                                 and unsubscribe is not None
                             ):
+                                context.settle(mutation)
                                 unsubscribe()
 
                 unsubscribe = context.bridge.host.subscribe(
                     updated,
                     notebook_id=request.path_params["id"],
                     types={"run"},
+                )
+            elif operation in {
+                "runtime.start",
+                "runtime.stop",
+                "runtime.restart",
+            }:
+                lifecycle_accepted, unsubscribe = _watch_lifecycle(
+                    context,
+                    mutation,
+                    operation=operation,
+                    notebook_id=request.path_params["id"],
+                    request_id=key,
                 )
 
             def completed(task: asyncio.Task[Response]) -> None:
@@ -194,6 +292,12 @@ def _mutation(operation: str) -> Callable[[_Endpoint], _Endpoint]:
                     context.replies.pop(key, None)
                     if unsubscribe is not None:
                         unsubscribe()
+                elif lifecycle_accepted is not None:
+                    lifecycle_accepted(task.result())
+                elif mutation.expires_at is None and (
+                    mutation.run is None or mutation.run.status == "completed"
+                ):
+                    context.settle(mutation)
 
             task.add_done_callback(completed)
             # A disconnected waiter must not cancel a shared mutation.
@@ -204,24 +308,100 @@ def _mutation(operation: str) -> Callable[[_Endpoint], _Endpoint]:
     return decorate
 
 
+def _watch_lifecycle(
+    context: HostContext,
+    mutation: CachedMutation,
+    *,
+    operation: str,
+    notebook_id: str,
+    request_id: str,
+) -> tuple[Callable[[Response], None], Callable[[], None]]:
+    runtime_id: protocol.RuntimeId | None = None
+    previous_id: protocol.RuntimeId | None = None
+    early: list[RoutedEvent] = []
+
+    def settle() -> None:
+        context.settle(mutation)
+        unsubscribe()
+
+    def updated(event: RoutedEvent) -> None:
+        nonlocal previous_id
+        if mutation.expires_at is not None:
+            return
+        if runtime_id is None:
+            # A backend can finish synchronously, before the response exists.
+            early.append(event)
+            return
+        if isinstance(event.event, protocol.NotebookRemovedEvent):
+            settle()
+        elif isinstance(event.event, protocol.RuntimeEvent):
+            runtime = event.event.data.runtime
+            if (
+                operation == "runtime.restart"
+                and event.event.data.request_id == request_id
+                and runtime.status == "terminating"
+                and runtime.id != runtime_id
+            ):
+                previous_id = runtime.id
+            if (
+                operation != "runtime.stop"
+                and runtime.id == runtime_id
+                and runtime.status in ("running", "failed")
+            ):
+                settle()
+        elif isinstance(event.event, protocol.RuntimeRemovedEvent):
+            if event.event.data.id == runtime_id or (
+                event.event.data.id == previous_id
+                and event.event.data.request_id != request_id
+            ):
+                # A later stop can cancel a restart before its replacement starts.
+                settle()
+
+    unsubscribe = context.bridge.host.subscribe(
+        updated, notebook_id=notebook_id, types={"runtime", "notebook"}
+    )
+
+    def accepted(response: Response) -> None:
+        nonlocal runtime_id
+        if response.status_code == 202:
+            runtime_id = msgspec.json.decode(
+                response.body, type=protocol.Runtime
+            ).id
+            for event in early:
+                updated(event)
+        else:
+            settle()
+        early.clear()
+
+    return accepted, unsubscribe
+
+
 async def _execute_mutation(endpoint: _Endpoint, request: Request) -> Response:
     try:
         return await endpoint(request)
     except NoRuntime as e:
         return problem(409, "no-runtime", str(e))
+    except DecisionRequired as e:
+        return problem(409, "decision-required", str(e), decisions=e.decisions)
+    except EditConflict as e:
+        return problem(
+            409,
+            "conflict",
+            str(e),
+            edit=protocol.EditConflict(
+                change=e.change, cell=e.cell, document=e.document
+            ),
+        )
     except Conflict as e:
         return problem(409, "conflict", str(e))
+    except Invalid as e:
+        return problem(400, "invalid-request", str(e))
     except NotFound as e:
         return problem(404, "not-found", str(e))
     except msgspec.DecodeError as e:
         return problem(400, "invalid-request", str(e))
     except HTTPException as e:
-        kind = {
-            400: "invalid-request",
-            404: "not-found",
-            409: "conflict",
-        }[e.status_code]
-        return problem(e.status_code, kind, e.detail)
+        return problem(e.status_code, detail=e.detail)
 
 
 def _reply(status: int, body: msgspec.Struct | None = None) -> Response:
@@ -242,96 +422,330 @@ async def _decode(request: Request, kind: type[_Body]) -> _Body:
 async def _events(request: Request) -> Response:
     """Stream catalog snapshots and updates.
 
-    `Last-Event-ID` resumes from a cursor; `types` filters event kinds.
+    `Last-Event-ID` resumes from a cursor. `types` filters event kinds.
     """
     context = _context(request)
     cursor = _cursor(request)
     if isinstance(cursor, Response):
         return cursor
+    types = _types(request)
+    if isinstance(types, Response):
+        return types
     # Refresh on connection because the catalog has no directory watcher.
     await context.bridge.refresh()
-    return _stream(context, cursor, _types(request), notebook_id=None)
+    return _stream(context, cursor, types, notebook_id=None)
 
 
 async def _notebook_events(request: Request) -> Response:
     """Stream notebook events, attaching the client until disconnect."""
     context = _context(request)
     try:
-        notebook = _notebook(request)
+        notebook = await _notebook(request)
     except NotFound as e:
         return problem(404, "not-found", str(e))
+    except Conflict as e:
+        return problem(409, "conflict", str(e))
     cursor = _cursor(request)
     if isinstance(cursor, Response):
         return cursor
+    types = _types(request)
+    if isinstance(types, Response):
+        return types
     run_id = request.query_params.get("run_id")
     if run_id == "":
         return problem(400, "invalid-request", "run_id must not be empty")
-    attachment = notebook.attach()
+    try:
+        attachment = notebook.attach(
+            identity=request.headers.get(ATTACHMENT_IDENTITY),
+            kind=request.headers.get(ATTACHMENT_KIND),
+            name=request.headers.get(ATTACHMENT_NAME),
+        )
+    except msgspec.ValidationError as e:
+        return problem(400, "invalid-request", _attachment_problem(e))
     return _stream(
         context,
         cursor,
-        _types(request),
+        types,
         notebook_id=notebook.id,
         run_id=run_id,
         on_close=lambda: notebook.detach(attachment.id),
     )
 
 
-def _cursor(request: Request) -> int | Response | None:
-    raw = request.headers.get("Last-Event-ID")
-    if raw is None:
-        return None
-    if not raw.isdigit():
-        return problem(400, "invalid-request", "Last-Event-ID must be an id")
-    return int(raw)
+def editor_events_route(base_url: str = "") -> WebSocketRoute:
+    """Expose the notebook event socket through editor authentication."""
+    return WebSocketRoute(
+        f"{base_url}{HOST_API_PATH}/notebooks/{{id}}/events/ws",
+        _editor_events_ws,
+    )
 
 
-def _types(request: Request) -> set[str] | None:
-    asked = request.query_params.get("types")
-    if not asked:
-        return None
-    return {kind for kind in asked.split(",") if kind}
+async def _editor_events_ws(websocket: WebSocket) -> None:
+    state = AppStateBase.from_app(websocket.app)
+    if state.enable_auth and not validate_auth(websocket):
+        await websocket.close(
+            code=1008, reason="Editor authentication required"
+        )
+        return
+    # TODO: Move editor lifecycle and recipient routing to host attachments so
+    # event subscriptions no longer need the legacy session_id.
+    if "session_id" not in websocket.query_params:
+        await _notebook_events_ws(websocket)
+        return
+
+    if "run_id" in websocket.query_params:
+        await websocket.close(
+            code=1008,
+            reason="Editor sessions do not support run_id filtering",
+        )
+        return
+
+    cursor = _cursor(websocket)
+    if isinstance(cursor, Response):
+        await websocket.close(code=1008, reason="Invalid event cursor")
+        return
+    types = _types(websocket)
+    if isinstance(types, Response):
+        await websocket.close(code=1008, reason="Invalid event types")
+        return
+    app_state = AppState(websocket)
+    params = parse_connection_params(app_state)
+    if isinstance(params, ConnectionRejection):
+        await websocket.close(params.code, params.reason)
+        return
+    bridge = _context(websocket).bridge
+    try:
+        notebook = await _notebook(websocket)
+    except (NotFound, Conflict) as exc:
+        await websocket.close(code=1008, reason=str(exc))
+        return
+    manager = app_state.session_manager
+    app = manager.app_manager(params.file_key)
+    record = bridge.index.notebook_for(app.path)
+    existing = manager.get_session(params.session_id)
+    if (
+        record is None
+        or record.id != notebook.id
+        or (
+            existing is not None and existing.app_file_manager.path != app.path
+        )
+    ):
+        await websocket.close(
+            code=1008, reason="Session notebook does not match"
+        )
+        return
+    await SessionEventStream(
+        websocket,
+        notebook=notebook,
+        bridge=bridge,
+        manager=manager,
+        params=params,
+        doc_manager=DOC_MANAGER,
+        types=types,
+        cursor=cursor,
+    ).start()
+
+
+async def _notebook_events_ws(websocket: WebSocket) -> None:
+    """Send a snapshot or replay, then live notebook events."""
+    cursor = _cursor(websocket)
+    if isinstance(cursor, Response):
+        await websocket.close(code=1008, reason="Invalid event cursor")
+        return
+    types = _types(websocket)
+    if isinstance(types, Response):
+        await websocket.close(code=1008, reason="Invalid event types")
+        return
+    run_id = websocket.query_params.get("run_id")
+    if run_id == "":
+        await websocket.close(code=1008, reason="run_id must not be empty")
+        return
+    try:
+        notebook = await _notebook(websocket)
+        attachment = notebook.attach(
+            identity=websocket.headers.get(ATTACHMENT_IDENTITY),
+            kind=websocket.headers.get(ATTACHMENT_KIND),
+            name=websocket.headers.get(ATTACHMENT_NAME),
+        )
+    except (NotFound, Conflict) as exc:
+        await websocket.close(code=1008, reason=str(exc))
+        return
+    except msgspec.ValidationError as exc:
+        await websocket.close(code=1008, reason=_attachment_problem(exc))
+        return
+
+    bridge = _context(websocket).bridge
+
+    async def send_events(
+        subscription: _EventSubscription, cancel_scope: CancelScope
+    ) -> None:
+        try:
+            for event in subscription.initial:
+                await websocket.send_text(serialize_event(event))
+            while True:
+                event = await subscription.next()
+                await websocket.send_text(serialize_event(event))
+        except WebSocketDisconnect:
+            cancel_scope.cancel()
+
+    message = None
+    try:
+        with _subscribe_events(
+            bridge,
+            cursor,
+            types,
+            notebook_id=notebook.id,
+            run_id=run_id,
+            include_session=True,
+        ) as subscription:
+            await websocket.accept()
+            async with create_task_group() as tasks:
+                tasks.start_soon(send_events, subscription, tasks.cancel_scope)
+                try:
+                    message = await websocket.receive()
+                finally:
+                    tasks.cancel_scope.cancel()
+            if (
+                message is not None
+                and message["type"] != "websocket.disconnect"
+            ):
+                await websocket.close(
+                    code=1003, reason="This socket only sends events"
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        notebook.detach(attachment.id)
+
+
+def _cursor(request: HTTPConnection) -> str | Response | None:
+    try:
+        return stream_options.cursor(request)
+    except ValueError as exc:
+        return problem(400, "invalid-request", str(exc))
+
+
+def _types(request: HTTPConnection) -> set[str] | Response | None:
+    try:
+        return stream_options.types(request)
+    except ValueError as exc:
+        return problem(400, "invalid-request", str(exc))
+
+
+def _attachment_problem(error: msgspec.ValidationError) -> str:
+    """Name the request header behind a rejected attachment field."""
+    detail = str(error)
+    for field, header in _ATTACHMENT_HEADERS.items():
+        if detail.endswith(f"`$.{field}`"):
+            return f"{header} is invalid"
+    return "attachment headers are invalid"
+
+
+def _initial_events(
+    bridge: SessionBridge,
+    cursor: str | None,
+    types: set[str] | None,
+    *,
+    notebook_id: protocol.NotebookId | None,
+    run_id: str | None = None,
+    include_session: bool = False,
+) -> list[RoutedEvent]:
+    """Capture a snapshot or replay, with `ready` marking its end."""
+    events = bridge.host.events(
+        cursor, notebook_id=notebook_id, types=types, run_id=run_id
+    )
+    needs_snapshot = cursor is None or isinstance(
+        events[0].event, protocol.ResetEvent
+    )
+    if include_session and notebook_id is not None and needs_snapshot:
+        ready = events.pop()
+        events.extend(
+            event
+            for event in bridge.session_snapshot(notebook_id)
+            if event.wanted(types, run_id)
+        )
+        events.append(ready)
+    return events
+
+
+class _EventSubscription:
+    def __init__(
+        self, initial: list[RoutedEvent], queue: asyncio.Queue[RoutedEvent]
+    ) -> None:
+        self.initial = initial
+        self._queue = queue
+        self._ready_id = initial[-1].position or 0
+
+    async def next(self) -> RoutedEvent:
+        """Wait for a live event not already covered by the initial state."""
+        while True:
+            event = await self._queue.get()
+            if event.position is None or event.position > self._ready_id:
+                return event
+
+
+@contextmanager
+def _subscribe_events(
+    bridge: SessionBridge,
+    cursor: str | None,
+    types: set[str] | None,
+    *,
+    notebook_id: protocol.NotebookId | None,
+    run_id: str | None = None,
+    include_session: bool = False,
+) -> Iterator[_EventSubscription]:
+    queue: asyncio.Queue[RoutedEvent] = asyncio.Queue()
+    # Subscribe and capture state in one event-loop turn to avoid lost updates.
+    unsubscribe = bridge.host.subscribe(
+        queue.put_nowait,
+        notebook_id=notebook_id,
+        types=types,
+        run_id=run_id,
+    )
+    try:
+        initial = _initial_events(
+            bridge,
+            cursor,
+            types,
+            notebook_id=notebook_id,
+            run_id=run_id,
+            include_session=include_session,
+        )
+        yield _EventSubscription(initial, queue)
+    finally:
+        unsubscribe()
 
 
 def _stream(
     context: HostContext,
-    cursor: int | None,
+    cursor: str | None,
     types: set[str] | None,
     *,
-    notebook_id: str | None,
+    notebook_id: protocol.NotebookId | None,
     run_id: str | None = None,
     on_close: Callable[[], None] | None = None,
 ) -> Response:
-    host = context.bridge.host
-
     async def body() -> AsyncIterator[bytes]:
-        queue: asyncio.Queue[Event] = asyncio.Queue()
-        # Subscribe before reading initial events to avoid losing updates.
-        # Queued events at or before the ready cursor are skipped.
-        unsubscribe = host.subscribe(
-            queue.put_nowait,
-            notebook_id=notebook_id,
-            types=types,
-            run_id=run_id,
-        )
         try:
-            initial = host.events(
-                cursor, notebook_id=notebook_id, types=types, run_id=run_id
-            )
-            for event in initial:
-                yield _frame(event)
-            ready_id = initial[-1].id or 0
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), PING_SECONDS)
-                except asyncio.TimeoutError:
-                    yield PING
-                    continue
-                if event.id is not None and event.id <= ready_id:
-                    continue
-                yield _frame(event)
+            with _subscribe_events(
+                context.bridge,
+                cursor,
+                types,
+                notebook_id=notebook_id,
+                run_id=run_id,
+            ) as subscription:
+                for event in subscription.initial:
+                    yield _frame(event)
+                while True:
+                    try:
+                        event = await asyncio.wait_for(
+                            subscription.next(), PING_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        yield PING
+                        continue
+                    yield _frame(event)
         finally:
-            unsubscribe()
             if on_close is not None:
                 on_close()
 
@@ -340,21 +754,17 @@ def _stream(
     )
 
 
-def _frame(event: Event) -> bytes:
+def _frame(event: RoutedEvent) -> bytes:
     """Encode an event as an SSE frame."""
-    lines = []
-    if event.id is not None:
-        lines.append(f"id: {event.id}")
-    lines.append(f"event: {event.name}")
-    data = b"{}" if event.data is None else msgspec.json.encode(event.data)
-    lines.append(f"data: {data.decode()}")
-    return ("\n".join(lines) + "\n\n").encode()
+    return serialize_sse_event(event).encode()
 
 
 # ---- notebooks -----------------------------------------------------------------
 
 
 def _inside_project(path: str) -> Path:
+    if "\x00" in path:
+        raise HTTPException(400, "path must not contain NUL")
     relative = Path(path)
     if relative.is_absolute() or ".." in relative.parts:
         raise HTTPException(400, "path must stay in the project")
@@ -391,6 +801,8 @@ async def _update_notebook(request: Request) -> Response:
     record = _record(request)
     body = await _decode(request, protocol.UpdateNotebookRequest)
 
+    if body.path is msgspec.UNSET and body.name is msgspec.UNSET:
+        raise HTTPException(400, "path or name is required")
     index = context.bridge.index
     target = None
     if body.path is not msgspec.UNSET:
@@ -409,11 +821,57 @@ async def _update_notebook(request: Request) -> Response:
 
 @_mutation("notebook.delete")
 async def _delete_notebook(request: Request) -> Response:
-    """Delete the notebook and file; return 409 while a runtime exists."""
+    """Delete the notebook and its file if it has no runtime."""
     context = _context(request)
     key = request.headers["Idempotency-Key"]
-    await context.bridge.delete(_notebook(request).id, request_id=key)
+    await context.bridge.delete(_record(request).id, request_id=key)
     return _reply(204, None)
+
+
+@_mutation("notebook.edit")
+async def _edit_notebook(request: Request) -> Response:
+    """Apply an edit as one unit; 409 with `edit` when a precondition is stale."""
+    context = _context(request)
+    key = request.headers["Idempotency-Key"]
+    notebook = await _notebook(request)
+    body = await _decode(request, protocol.EditRequest)
+    response = await context.bridge.edit(
+        notebook.id, body.changes, request_id=key
+    )
+    return _reply(200, response)
+
+
+@_mutation("notebook.save")
+async def _save_notebook(request: Request) -> Response:
+    """Write the document to its file; 409 with `edit` when `If-Match` is stale."""
+    context = _context(request)
+    key = request.headers["Idempotency-Key"]
+    notebook = await _notebook(request)
+    body = await _decode(request, protocol.SaveRequest)
+    response = await context.bridge.save(
+        notebook.id,
+        if_match=_if_match(request.headers.get("If-Match")),
+        decisions={} if body.decisions is msgspec.UNSET else body.decisions,
+        request_id=key,
+    )
+    return _reply(200, response)
+
+
+def _if_match(header: str | None) -> tuple[str, ...] | None:
+    """The etags an `If-Match` header accepts, or `None` when it accepts any.
+
+    The header is `*` or a comma-separated list of entity tags, each
+    optionally quoted. `If-Match` compares strongly (RFC 9110, 13.1.1),
+    so a tag marked weak with `W/` never matches and is left out.
+    """
+    if header is None or header.strip() == "*":
+        return None
+    tags = []
+    for part in header.split(","):
+        tag = part.strip()
+        if tag and not tag.startswith("W/"):
+            tags.append(tag.strip('"'))
+    return tuple(tags)
 
 
 @_mutation("notebook.open")
@@ -450,9 +908,9 @@ def _open_quietly(browser: str, url: str) -> None:
 
 @_mutation("runtime.start")
 async def _start_runtime(request: Request) -> Response:
-    """Start a runtime: 202 if created, 200 if already present."""
+    """Start a runtime and return 202, or 200 if it already exists."""
     key = request.headers["Idempotency-Key"]
-    notebook = _notebook(request)
+    notebook = await _notebook(request)
     await _decode(request, protocol.StartRuntimeRequest)
     runtime, created = notebook.start(request_id=key)
     return _reply(202 if created else 200, runtime)
@@ -462,7 +920,7 @@ async def _start_runtime(request: Request) -> Response:
 async def _stop_runtime(request: Request) -> Response:
     """Request shutdown and return 202 with the runtime marked terminating."""
     key = request.headers["Idempotency-Key"]
-    notebook = _notebook(request)
+    notebook = await _notebook(request)
     runtime = notebook.stop(request_id=key)
     return _reply(202, runtime)
 
@@ -471,7 +929,7 @@ async def _stop_runtime(request: Request) -> Response:
 async def _restart_runtime(request: Request) -> Response:
     """Return 202 with the replacement runtime in its starting state."""
     key = request.headers["Idempotency-Key"]
-    notebook = _notebook(request)
+    notebook = await _notebook(request)
     runtime = notebook.restart(request_id=key)
     return _reply(202, runtime)
 
@@ -481,9 +939,9 @@ async def _restart_runtime(request: Request) -> Response:
 
 @_mutation("runtime.run")
 async def _run(request: Request) -> Response:
-    """Queue a run and return 202; stream results through notebook events."""
+    """Queue a run and return 202. Results arrive through notebook events."""
     key = request.headers["Idempotency-Key"]
-    notebook = _notebook(request)
+    notebook = await _notebook(request)
     body = await _decode(request, protocol.RunRequest)
     if body.code is msgspec.UNSET or body.cells is not msgspec.UNSET:
         return problem(
@@ -495,7 +953,15 @@ async def _run(request: Request) -> Response:
 
 @_mutation("runtime.run")
 async def _interrupt(request: Request) -> Response:
-    """Request a run interruption: 202 if active, 409 if completed."""
-    notebook = _notebook(request)
-    interrupted = notebook.interrupt(request.path_params["run_id"])
+    """Interrupt an active run and return 202, or 409 if it has completed."""
+    notebook = await _notebook(request)
+    run_id = request.path_params["run_id"]
+    try:
+        interrupted = notebook.interrupt(run_id)
+    except NotFound:
+        # A completed scratch run is host history, not notebook state.
+        run = _context(request).bridge.host.run(notebook.id, run_id)
+        if run is not None and run.status == "completed":
+            raise Conflict(f"run {run_id} has already ended.") from None
+        raise
     return _reply(202, interrupted)

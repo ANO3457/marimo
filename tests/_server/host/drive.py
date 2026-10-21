@@ -16,12 +16,48 @@ if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
 
     from starlette.applications import Starlette
+    from starlette.testclient import WebSocketTestSession
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    from marimo._core.host import Host
 
 PORT = 1234
 """Server port used to validate the request's Host header."""
 
 AUTHORITY = f"127.0.0.1:{PORT}"
 LOOPBACK = ("127.0.0.1", 50000)
+
+
+def with_client_address(
+    app: ASGIApp, address: tuple[str, int] = LOOPBACK
+) -> ASGIApp:
+    """Set the peer address without requiring Starlette's newer `client` option."""
+
+    async def wrapped(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            scope = {**scope, "client": address}
+        await app(scope, receive, send)
+
+    return wrapped
+
+
+def position(host: Host, cursor: str) -> int:
+    """Return where a cursor the host issued falls in its stream."""
+    found = host._stream.position(cursor)
+    assert found is not None, f"{cursor} is not from this host"
+    return found
+
+
+def socket_snapshot(websocket: WebSocketTestSession) -> list[dict[str, Any]]:
+    """Read the opening snapshot or replay, including its ready boundary."""
+    events = []
+    while True:
+        event = websocket.receive_json()
+        events.append(event)
+        if event["event"] == "ready":
+            assert event["data"] == {}
+            assert isinstance(event["id"], str)
+            return events
 
 
 class Response:
@@ -143,7 +179,24 @@ async def wait_for(
     while not condition(response):
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise TimeoutError(f"gave up waiting; saw {response.names()}")
+            lifecycles = [
+                {
+                    "event": record["event"],
+                    **{
+                        key: value
+                        for key, value in record["data"][
+                            record["event"]
+                        ].items()
+                        if key in {"id", "run_id", "cell_id", "status"}
+                    },
+                }
+                for record in response.records
+                if record.get("event") in {"run", "execution"}
+            ]
+            raise TimeoutError(
+                f"gave up waiting after {timeout}s; saw {response.names()}; "
+                f"lifecycle events: {lifecycles}"
+            )
         response.changed.clear()
         try:
             await asyncio.wait_for(response.changed.wait(), remaining)

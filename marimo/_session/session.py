@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from marimo import _loggers
-from marimo._config.manager import MarimoConfigManager, ScriptConfigManager
+from marimo._config.manager import MarimoConfigManager, ScriptConfigReader
 from marimo._core.ids import mint
 from marimo._messaging.notebook.document import NotebookDocument
 from marimo._messaging.notification import (
@@ -115,7 +115,7 @@ class SessionImpl(Session):
         # its masked get_config() would turn runtime.dotenv into [] and that
         # empty list would then win the merge the kernel reads unmasked.
         config_manager = config_manager.with_partial(
-            ScriptConfigManager(app_file_manager.path)
+            ScriptConfigReader(app_file_manager.path)
         )
         config = config_manager.get_config(hide_secrets=False)
         configured_venv = config.get("venv", {}).get("path")
@@ -249,6 +249,7 @@ class SessionImpl(Session):
         # NB. Read live at save time, so later settings edits apply too.
         self.app_file_manager.config_reader = config_manager
         self.room = Room()
+        self.connection_generation = 0
         self._kernel_manager = kernel_manager
         self.ttl_seconds = (
             ttl_seconds if ttl_seconds is not None else _DEFAULT_TTL_SECONDS
@@ -387,7 +388,7 @@ class SessionImpl(Session):
         task = self._kernel_manager.kernel_task
         if task is None or task.is_alive():
             return None
-        # ``exitcode`` is provided by multiprocessing.Process; threads don't
+        # `exitcode` is provided by multiprocessing.Process; threads don't
         # have one, so we treat absence as "unknown".
         exitcode = getattr(task, "exitcode", None)
         return classify_kernel_exit(exitcode)
@@ -464,6 +465,8 @@ class SessionImpl(Session):
         self.extensions.add(session_consumer)
         session_consumer.on_attach(self, self._event_bus)
         self.room.add_consumer(session_consumer, main=main)
+        if main:
+            self.connection_generation += 1
 
     def get_current_state(self) -> SessionView:
         """Return the current state of the session."""

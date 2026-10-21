@@ -18,14 +18,17 @@ import type {
   DependencyTreeNode,
   DependencyTreeResponse,
 } from "@/core/network/types";
-import { withPackageInvalidation } from "@/core/packages/package-data";
+import {
+  invalidatePackageData,
+  withPackageInvalidation,
+} from "@/core/packages/package-data";
 import { useInstallPackages } from "@/core/packages/useInstallPackage";
 import { sandboxAtom, sandboxSyncAtom } from "@/core/packages/sandbox-state";
 import { store } from "@/core/state/jotai";
-import { WebSocketState } from "@/core/websocket/types";
+import { ConnectionState } from "@/core/websocket/types";
 import PackagesPanel from "../packages-panel";
 import { PanelSectionProvider } from "../panel-context";
-import { SandboxToggle } from "../sandbox-toggle";
+import { RuntimeStatusToggle } from "../runtime-status-toggle";
 
 const { openSettings } = vi.hoisted(() => ({
   openSettings: vi.fn(),
@@ -71,7 +74,7 @@ function renderPanel(
       ? { backend: context.backend, manifest: "", filename: "notebook.py" }
       : null,
   );
-  store.set(connectionAtom, { state: WebSocketState.OPEN });
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
   store.set(sandboxSyncAtom, { kind: "succeeded" });
   const getPackageList = vi.fn().mockResolvedValue({ packages: [] });
   const client = MockRequestClient.create({
@@ -87,7 +90,7 @@ function renderPanel(
       <Provider store={store}>
         <TooltipProvider>
           <PanelSectionProvider value="sidebar">
-            <SandboxToggle section="sidebar" />
+            <RuntimeStatusToggle section="sidebar" />
             <PackagesPanel />
           </PanelSectionProvider>
         </TooltipProvider>
@@ -143,6 +146,32 @@ describe("PackagesPanel", () => {
     expect(screen.queryByText("cycle")).not.toBeInTheDocument();
   });
 
+  it("collapses expanded nodes when the dependency tree is refreshed", async () => {
+    const { client } = renderPanel(
+      { kind: "sandbox", backend: "pixi" },
+      populatedTree,
+    );
+    fireEvent.click(await screen.findByRole("treeitem", { name: /polars/ }));
+    expect(screen.getByText("already in tree")).toBeInTheDocument();
+
+    vi.mocked(client.getDependencyTree).mockResolvedValue({
+      tree: structuredClone(populatedTree),
+      context: { kind: "sandbox", backend: "pixi" },
+    });
+    act(() => invalidatePackageData());
+
+    await waitFor(() =>
+      expect(client.getDependencyTree).toHaveBeenCalledTimes(2),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("already in tree")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("treeitem", { name: /polars/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
   it("keeps the configured package manager changeable outside a sandbox", async () => {
     const { getPackageList } = renderPanel({
       kind: "package-manager",
@@ -186,7 +215,7 @@ it("refreshes an open panel when a package is installed elsewhere, after install
     manifest: "",
     filename: "notebook.py",
   });
-  store.set(connectionAtom, { state: WebSocketState.OPEN });
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
   store.set(sandboxSyncAtom, { kind: "succeeded" });
   store.set(requestClientAtom, withPackageInvalidation(client));
   function InstallElsewhere() {
@@ -201,7 +230,7 @@ it("refreshes an open panel when a package is installed elsewhere, after install
     <Provider store={store}>
       <TooltipProvider>
         <PanelSectionProvider value="sidebar">
-          <SandboxToggle section="sidebar" />
+          <RuntimeStatusToggle section="sidebar" />
           <PackagesPanel />
         </PanelSectionProvider>
         <InstallElsewhere />
@@ -221,7 +250,7 @@ it("refreshes an open panel when a package is installed elsewhere, after install
 });
 
 it("keeps packages and the install draft visible while blocking mutations during sync", async () => {
-  store.set(connectionAtom, { state: WebSocketState.OPEN });
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
   renderPanel({ kind: "sandbox", backend: "pixi" }, populatedTree);
   await screen.findByRole("treeitem", { name: /polars/ });
   const input = screen.getByPlaceholderText("Add packages to pixi sandbox...");
@@ -235,7 +264,7 @@ it("keeps packages and the install draft visible while blocking mutations during
   expect(
     screen.queryByRole("list", { name: "Notebook startup stages" }),
   ).not.toBeInTheDocument();
-  const toggle = screen.getByRole("button", { name: "pixi sandbox" });
+  const toggle = screen.getByRole("button", { name: /^pixi sandbox, / });
   fireEvent.click(toggle);
   expect(toggle).toHaveAttribute("aria-expanded", "false");
   act(() =>

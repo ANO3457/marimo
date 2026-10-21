@@ -18,6 +18,7 @@ from marimo._messaging.notification import (
     DataSourceConnectionsNotification,
     EnvironmentOperationNotification,
     EnvironmentState,
+    EnvironmentStateNotification,
     EsmSpec,
     InterruptedNotification,
     ModelClose,
@@ -599,8 +600,21 @@ class SessionView:
 
         self.last_execution_time[cell_id] = time_elapsed
 
-    @property
-    def notifications(self) -> list[NotificationMessage]:
+    def snapshot_notifications(self) -> list[NotificationMessage]:
+        """Copy retained notifications for a connecting client.
+
+        The caller supplies kernel-ready before replaying these notifications.
+        """
+        notifications: list[NotificationMessage] = [
+            EnvironmentStateNotification(source=source, state=state)
+            for source, state in self._environment_states.items()
+        ]
+        if self.startup_progress is not None:
+            notifications.append(self.startup_progress)
+        notifications.extend(self._notebook_notifications())
+        return copy.deepcopy(notifications)
+
+    def _notebook_notifications(self) -> list[NotificationMessage]:
         all_notifications: list[NotificationMessage] = []
         if self.variable_notifications.variables:
             all_notifications.append(self.variable_notifications)

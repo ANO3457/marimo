@@ -48,6 +48,7 @@ import { DEFAULT_AI_MODEL, type UserConfig } from "@/core/config/config-schema";
 import { isWasm } from "@/core/wasm/utils";
 import { cn } from "@/utils/cn";
 import { Events } from "@/utils/events";
+import { Objects } from "@/utils/objects";
 import { Strings } from "@/utils/strings";
 import { AIModelDropdown, getProviderLabel } from "../ai/ai-model-dropdown";
 import {
@@ -681,7 +682,10 @@ export const CustomProvidersConfig: React.FC<AiConfigProps> = ({
         };
 
         const removeProvider = (providerName: string) => {
-          const { [providerName]: _, ...rest } = customProviders;
+          const rest = Objects.filter(
+            customProviders,
+            (_, name) => name !== providerName,
+          );
           // Reset to clear nested dirty state, then set new value
           form.resetField("ai.custom_providers");
           form.setValue("ai.custom_providers", rest, { shouldDirty: true });
@@ -1846,7 +1850,7 @@ export const AddModelForm: React.FC<{
         id={modelNameInputId}
         value={modelName}
         onChange={(e) => setModelName(e.target.value)}
-        placeholder="gpt-4"
+        placeholder="gpt-5.6-sol"
         className="text-xs mb-0"
       />
     </div>

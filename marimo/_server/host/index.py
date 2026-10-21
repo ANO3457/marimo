@@ -1,5 +1,5 @@
 # Copyright 2026 Marimo. All rights reserved.
-"""Workspace files indexed as a host project.
+"""Workspace files and explicitly opened notebooks in the host catalog.
 
 Notebook IDs persist across rescans and recorded file moves.
 """
@@ -7,7 +7,6 @@ Notebook IDs persist across rescans and recorded file moves.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,31 +19,30 @@ from marimo._server.host import OPERATIONS
 from marimo._server.workspace import flatten_files
 
 if TYPE_CHECKING:
-    from marimo._core.backend import Backend
-    from marimo._core.host import Host
+    from marimo._core.host import Host, NotebookInitializer
     from marimo._server.models.files import FileInfo
     from marimo._server.workspace import NotebookWorkspace
 
 _TRUNCATED = "The scan stopped at its depth, file count, or time limit"
 
-MakeBackend = Callable[[protocol.NotebookId], "Backend"]
-
 
 class WorkspaceIndex:
-    """A host project and its indexed notebook files."""
+    """Workspace files and explicitly opened files exposed as host notebooks."""
 
     def __init__(
         self,
         host: Host,
         workspace: NotebookWorkspace,
-        make_backend: MakeBackend,
+        initialize: NotebookInitializer,
     ) -> None:
         self._host = host
+        self._initialize = initialize
         self._workspace = workspace
-        self._make_backend = make_backend
         self._root = _root_of(workspace)
         self.project_id = mint(protocol.ProjectId, "proj")
         self._ids: dict[Path, protocol.NotebookId] = {}
+        self._open_project_id: protocol.ProjectId | None = None
+        self._open_files: dict[protocol.NotebookId, Path] = {}
         self._names: dict[protocol.NotebookId, str] = {}
         """Client-selected names preserved across rescans."""
         self._refresh_lock = asyncio.Lock()
@@ -96,7 +94,8 @@ class WorkspaceIndex:
                 continue
             if notebook.id in seen or self._exists(notebook):
                 continue
-            if self._host.notebook(notebook.id).runtime is not None:
+            loaded = self._host.peek_notebook(notebook.id)
+            if loaded is not None and loaded.runtime is not None:
                 self._host.update_notebook(
                     replace(notebook, path=None, updated_at=None)
                 )
@@ -117,23 +116,93 @@ class WorkspaceIndex:
             return None
         return self._publish(file, modified, request_id=request_id)
 
+    def register_open_notebook(self, path: str) -> protocol.Notebook:
+        """Register an authorized file, including files outside the workspace."""
+        resolved = self._workspace.resolve(path)
+        assert resolved is not None
+        existing = self.notebook_for(resolved) or self.ensure(resolved)
+        if existing is not None:
+            return existing
+        return self._publish_open_notebook(
+            mint(protocol.NotebookId, "nb"), Path(resolved)
+        )
+
+    def _publish_open_notebook(
+        self,
+        notebook_id: protocol.NotebookId,
+        file: Path,
+        *,
+        request_id: str | None = None,
+    ) -> protocol.Notebook:
+        if self._open_project_id is None:
+            self._open_project_id = mint(protocol.ProjectId, "proj")
+            self._host.update_project(
+                protocol.Project(
+                    id=self._open_project_id,
+                    name="Open notebooks",
+                    root=None,
+                    status="indexed",
+                    message=None,
+                    operations=(),
+                )
+            )
+        record = protocol.Notebook(
+            id=notebook_id,
+            project_id=self._open_project_id,
+            path=None,
+            name=self._names.get(notebook_id, file.stem),
+            operations=tuple(
+                op
+                for op in OPERATIONS
+                if op
+                not in {
+                    "notebook.create",
+                    "notebook.update",
+                    "notebook.delete",
+                }
+            ),
+            updated_at=None,
+        )
+        self._open_files[record.id] = file
+        if notebook_id in self._host.notebooks:
+            self._host.update_notebook(record, request_id=request_id)
+        else:
+            self._host.add_notebook(record, self._initialize)
+        return record
+
+    def untitled(self) -> protocol.Notebook:
+        """Register an editor document before it has a file."""
+        record = protocol.Notebook(
+            id=mint(protocol.NotebookId, "nb"),
+            project_id=self.project_id,
+            path=None,
+            name="Untitled",
+            operations=("notebook.edit",),
+            updated_at=None,
+        )
+        self._host.add_notebook(record, self._initialize)
+        return record
+
     def moved(
         self,
         notebook_id: protocol.NotebookId,
         path: str,
         *,
         request_id: str | None = None,
-    ) -> protocol.Notebook | None:
+    ) -> protocol.Notebook:
         """Update a notebook's file path, keeping its ID.
 
-        Return `None` for a path outside the project.
+        Files outside the workspace belong to the Open notebooks project.
         """
         relative = self._relative(Path(path))
-        if relative is None:
-            return None
         for old, known in list(self._ids.items()):
             if known == notebook_id:
                 del self._ids[old]
+        if relative is None:
+            return self._publish_open_notebook(
+                notebook_id, Path(path).resolve(), request_id=request_id
+            )
+        self._open_files.pop(notebook_id, None)
         self._ids[relative] = notebook_id
         assert self._root is not None
         file = self._root / relative
@@ -141,7 +210,9 @@ class WorkspaceIndex:
             modified: float | None = file.stat().st_mtime
         except OSError:
             modified = None
-        return self._publish(file, modified, request_id=request_id)
+        record = self._publish(file, modified, request_id=request_id)
+        assert record is not None
+        return record
 
     def rename(
         self,
@@ -168,12 +239,16 @@ class WorkspaceIndex:
             if known == notebook_id:
                 del self._ids[path]
         self._names.pop(notebook_id, None)
+        self._open_files.pop(notebook_id, None)
         self._host.remove_notebook(notebook_id, request_id=request_id)
 
     def notebook_for(self, path: str | None) -> protocol.Notebook | None:
         """Look up a cataloged notebook by file path."""
         if path is None:
             return None
+        for notebook_id, file in self._open_files.items():
+            if file.resolve() == Path(path).resolve():
+                return self._host.notebooks[notebook_id]
         relative = self._relative(Path(path))
         if relative is None or relative not in self._ids:
             return None
@@ -181,6 +256,8 @@ class WorkspaceIndex:
 
     def file_of(self, notebook_id: protocol.NotebookId) -> Path | None:
         """Return a notebook's absolute file path, if available."""
+        if notebook_id in self._open_files:
+            return self._open_files[notebook_id]
         record = self._host.notebooks.get(notebook_id)
         if record is None or record.path is None or self._root is None:
             return None
@@ -215,8 +292,9 @@ class WorkspaceIndex:
         if notebook_id in self._host.notebooks:
             self._host.update_notebook(record, request_id=request_id)
         else:
-            backend = self._make_backend(notebook_id)
-            self._host.add_notebook(record, backend, request_id=request_id)
+            self._host.add_notebook(
+                record, self._initialize, request_id=request_id
+            )
         return record
 
     def _exists(self, notebook: protocol.Notebook) -> bool:

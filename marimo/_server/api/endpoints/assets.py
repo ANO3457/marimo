@@ -50,6 +50,7 @@ from marimo._utils.paths import (
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+
 LOGGER = _loggers.marimo_logger()
 
 # Router for serving static assets

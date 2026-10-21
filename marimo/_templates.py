@@ -23,7 +23,6 @@ from marimo._schemas.session import NotebookSessionV1
 from marimo._server.tokens import SkewProtectionToken
 from marimo._session.model import SessionMode
 from marimo._session.notebook import read_css_file, read_html_head_file
-from marimo._utils.env import is_env_true
 from marimo._utils.versions import is_editable
 from marimo._version import __version__
 
@@ -139,15 +138,13 @@ def _get_mount_config(
         "runtime_config": runtime_config,
     }
 
-    pair_preview = ""
-    if is_env_true("MARIMO_PAIR_NEXT"):
-        pair_preview = ',\n            "pairPreview": ' + json_script(
-            {
-                "command": get_pair_command(),
-                "templates": asdict(load_prompt_templates()),
-            }
-        )
-
+    pair_config = json_script(
+        {
+            "command": get_pair_command(),
+            "templates": asdict(load_prompt_templates()),
+            "hostEnabled": mode == "edit",
+        }
+    )
     return """{{
             "filename": {filename},
             "cwd": {cwd},
@@ -162,11 +159,12 @@ def _get_mount_config(
             "view": {view},
             "notebook": {notebook},
             "session": {session},
-            "runtimeConfig": {runtime_config}{pair_preview}
+            "runtimeConfig": {runtime_config},
+            "pairConfig": {pair_config}
         }}
 """.format(
         **{k: json_script(v) for k, v in options.items()},
-        pair_preview=pair_preview,
+        pair_config=pair_config,
     ).strip()
 
 

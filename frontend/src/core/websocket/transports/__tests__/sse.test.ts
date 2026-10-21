@@ -90,6 +90,23 @@ describe("SseTransport", () => {
     expect(messages[1].data).toBe("line1\nline2");
   });
 
+  it("preserves host event names and cursors without carrying IDs into snapshots", async () => {
+    const { stream, push } = createControllableStream();
+    fetchMock.mockResolvedValueOnce(sseResponse(stream));
+    transport.reconnect();
+    await vi.waitFor(() => expect(opens).toHaveLength(1));
+
+    push("id: cursor-1\nevent: rea");
+    push("dy\ndata: {}\n\n: keep-alive\n\nevent: reset\ndata: {}\n\n");
+    push('event: marimo\ndata: {"marimo":\ndata: {"op":"reconnected"}}\n\n');
+    await vi.waitFor(() => expect(messages).toHaveLength(3));
+    expect(messages.map((message) => JSON.parse(message.data))).toEqual([
+      { event: "ready", id: "cursor-1", data: {} },
+      { event: "reset", data: {} },
+      { event: "marimo", data: { marimo: { op: "reconnected" } } },
+    ]);
+  });
+
   it("ignores keep-alive comments", async () => {
     const { stream, push } = createControllableStream();
     fetchMock.mockResolvedValueOnce(sseResponse(stream));
@@ -108,8 +125,6 @@ describe("SseTransport", () => {
     transport.reconnect();
     await vi.waitFor(() => expect(opens).toHaveLength(1));
 
-    // Stop retrying when the consumer treats the close as terminal,
-    // mirroring useMarimoKernelConnection's terminal path.
     transport.addEventListener("close", () => transport.close());
     push('event: close\ndata: {"code": 1000, "reason": "MARIMO_SHUTDOWN"}\n\n');
     await vi.waitFor(() => expect(closes).toHaveLength(1));
@@ -146,8 +161,7 @@ describe("SseTransport", () => {
     fetchMock
       .mockResolvedValueOnce(sseResponse(first.stream))
       .mockResolvedValueOnce(sseResponse(second.stream));
-    // Mirror useMarimoKernelConnection's retry path: reconnect()
-    // synchronously from inside the close handler.
+    // Reconnect synchronously from the close handler.
     transport.addEventListener("close", () => transport.reconnect());
 
     transport.reconnect();

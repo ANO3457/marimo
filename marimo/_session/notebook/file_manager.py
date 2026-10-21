@@ -19,6 +19,7 @@ from marimo._environments.script_metadata import (
 from marimo._messaging.notebook.changes import (
     Transaction,
 )
+from marimo._messaging.notebook.document import NotebookCell
 from marimo._runtime.layout.layout import (
     LayoutConfig,
     read_layout_config,
@@ -44,8 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from marimo._ast.type_inference import TypeInferenceMode
-    from marimo._config.manager import MarimoConfigReader
-    from marimo._messaging.notebook.document import NotebookCell
+    from marimo._config.manager import MarimoConfigManager
     from marimo._server.models.models import (
         CopyNotebookRequest,
         SaveNotebookRequest,
@@ -83,17 +83,28 @@ class AppFileManager:
         self._defaults = defaults or AppDefaults()
 
         # User configuration for save-time options. Defaults apply when None.
-        self.config_reader: MarimoConfigReader | None = None
+        self.config_reader: MarimoConfigManager | None = None
 
         # Load the app
         self.app = self._load_app(self.path)
 
         # Track the last saved content to avoid reloading our own writes
         self._last_saved_content: str | None = None
+        # TODO(MO-7927): The host follows the editor's writes through this
+        # hook until the notebook owns persistence and no second writer
+        # remains to follow.
+        self.on_persisted: (
+            Callable[[Sequence[NotebookCell], dict[str, Any]], None] | None
+        ) = None
+        """Called with the cells and app config a save wrote, on its thread.
+
+        The cells are the snapshot the save was given, not the live
+        document, which another thread may have changed meanwhile.
+        """
 
         # Serializes concurrent writers. Reentrant so public entry points
         # can wrap the full "mutate app + _save_file" sequence while
-        # ``_save_file`` re-acquires for any direct caller.
+        # `_save_file` re-acquires for any direct caller.
         self._save_lock = threading.RLock()
         # Foreground writes supersede queued autosaves.
         self._autosave_generation = 0
@@ -143,7 +154,7 @@ class AppFileManager:
         """
         manager = AppFileManager(None)
         # Snapshot to an absolute path at assignment time so a later
-        # ``chdir`` cannot change which file ``self.path`` resolves to.
+        # `chdir` cannot change which file `self.path` resolves to.
         manager.filename = (
             os.path.abspath(str(filename)) if filename is not None else None
         )
@@ -507,11 +518,26 @@ class AppFileManager:
 
             if request.persist:
                 self._invalidate_autosaves()
-            return self._save_file(
+            contents = self._save_file(
                 filename_path,
                 notebook=self.app.to_ir(),
                 persist=request.persist,
             )
+            if request.persist:
+                self._persisted(
+                    [
+                        NotebookCell(id=i, code=c, name=n, config=f)
+                        for i, c, n, f in zip(
+                            cell_ids, codes, names, configs, strict=True
+                        )
+                    ]
+                )
+            return contents
+
+    def _persisted(self, cells: Sequence[NotebookCell]) -> None:
+        callback = self.on_persisted
+        if callback is not None:
+            callback(cells, self.app.config.asdict_difference())
 
     def capture_autosave_target(self) -> tuple[Path | None, int]:
         with self._save_lock:
@@ -556,11 +582,13 @@ class AppFileManager:
                 names=[cell.name for cell in cells],
                 configs=[cell.config for cell in cells],
             )
-            return self._save_file(
+            contents = self._save_file(
                 self._filename,
                 notebook=self.app.to_ir(),
                 persist=True,
             )
+            self._persisted(cells)
+            return contents
 
     def _invalidate_autosaves(self) -> None:
         self._autosave_generation += 1

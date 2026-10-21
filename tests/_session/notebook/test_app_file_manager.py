@@ -339,3 +339,23 @@ def test_line_length_follows_config_and_defaults_to_79(tmp_path: Path) -> None:
     }
     fm.config_reader = reader  # type: ignore[assignment]
     assert fm.line_length == 100
+
+
+def test_on_persisted_reports_the_cells_and_config_written(
+    tmp_path: Path,
+) -> None:
+    from marimo._ast.cell import CellConfig
+    from marimo._messaging.notebook.document import NotebookCell
+    from marimo._types.ids import CellId_t
+
+    nb = tmp_path / "nb.py"
+    nb.write_text(_NOTEBOOK_SOURCE.replace("App()", 'App(width="full")'))
+    fm = AppFileManager(str(nb))
+    seen: list[tuple[list[NotebookCell], dict[str, object]]] = []
+    fm.on_persisted = lambda cells, config: seen.append((list(cells), config))
+    (cell,) = fm.app.cell_manager.cell_data()
+    cells = [NotebookCell(CellId_t(cell.cell_id), "x = 2", "_", CellConfig())]
+
+    fm.save_from_cells(cells)
+
+    assert seen == [(cells, {"width": "full"})]
