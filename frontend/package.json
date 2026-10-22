@@ -166,10 +166,10 @@
   "scripts": {
     "preinstall": "npx only-allow pnpm",
     "ci": "cross-env CI=true run-s lint typecheck test build",
-    "start": "vite",
-    "dev": "vite",
+    "start": "node api.js && vite",
+    "dev": "node api.js && vite",
     "build:watch": "vite build --watch --outDir ../marimo/_static",
-    "build": "cross-env vite build",
+    "build": "node api.js && cross-env vite build",
     "test": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsgo",
