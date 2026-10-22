@@ -1,0 +1,33 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "codex/duckdb-nested-schemas",
+    "codex/lazy-table-pagination",
+    "dm/type-inference",
+    "fix/url-single-digit-port",
+    "main",
+    "origin",
+    "renovate/major-testing-dependencies",
+    "renovate/testing-dependencies"
+  ],
+  "parent": {
+    "codex/duckdb-nested-schemas": "main",
+    "codex/lazy-table-pagination": "main",
+    "dm/type-inference": "main",
+    "fix/url-single-digit-port": "main",
+    "main": null,
+    "origin": "main",
+    "renovate/major-testing-dependencies": "main",
+    "renovate/testing-dependencies": "main"
+  },
+  "order": [
+    "main",
+    "codex/duckdb-nested-schemas",
+    "codex/lazy-table-pagination",
+    "dm/type-inference",
+    "fix/url-single-digit-port",
+    "origin",
+    "renovate/major-testing-dependencies",
+    "renovate/testing-dependencies"
+  ]
+}
